@@ -25,8 +25,8 @@ from mjlab.terrains import TerrainEntityCfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
 
-from hac2k26.getup import mdp
-from hac2k26.getup.mdp.actions import SettleRelativeJointPositionActionCfg
+from hac2k26.ee_tracking import mdp
+from hac2k26.ee_tracking.mdp.actions import SettleRelativeJointPositionActionCfg
 
 
 def make_getup_env_cfg() -> ManagerBasedRlEnvCfg:

@@ -31,4 +31,6 @@ if __name__ == "__main__":
     from mjlab.entity.entity import Entity
 
     robot = Entity(get_panda_robot_cfg())
-    viewer.launch(robot.spec.compile())
+    m = robot.spec.compile()
+    print("nq:", m.nq, " nv:", m.nv)
+    print("joints:", [m.joint(i).name for i in range(m.njnt)])
