@@ -10,7 +10,7 @@ from mjlab.sensor import ContactMatch, ContactSensorCfg
 from mjlab.utils.spec_config import CollisionCfg
 
 from hac2k26.ee_tracking import mdp
-from hac2k26.ee_tracking.getup_env_cfg import make_getup_env_cfg
+from hac2k26.ee_tracking.tracking_env_cfg import make_getup_env_cfg
 
 _TORSO_HEIGHT = ...
 

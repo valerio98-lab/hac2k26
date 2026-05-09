@@ -19,3 +19,7 @@ scripts/
 
 # Tools
 .ruff_cache/
+
+*.md
+*.json
+*ipynb
