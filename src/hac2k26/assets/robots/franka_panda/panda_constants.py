@@ -1,15 +1,11 @@
 from robot_descriptions import panda_mj_description
-import os
 import mujoco
 from mjlab.actuator import BuiltinPositionActuatorCfg
 from mjlab.entity import EntityArticulationInfoCfg, EntityCfg
 
 
 def get_spec() -> mujoco.MjSpec:
-    nohand_path = os.path.join(
-        os.path.dirname(panda_mj_description.MJCF_PATH), "panda_nohand.xml"
-    )
-    return mujoco.MjSpec.from_file(nohand_path)
+    return mujoco.MjSpec.from_file(panda_mj_description.MJCF_PATH)
 
 
 # Gains match MuJoCo Menagerie franka_emika_panda/panda.xml.
