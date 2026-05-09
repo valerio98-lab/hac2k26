@@ -12,7 +12,7 @@ from mjlab.utils.spec_config import CollisionCfg
 from hac2k26.ee_tracking import mdp
 from hac2k26.ee_tracking.getup_env_cfg import make_getup_env_cfg
 
-_TORSO_HEIGHT = 0.275
+_TORSO_HEIGHT = ...
 
 
 def unitree_go1_getup_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
