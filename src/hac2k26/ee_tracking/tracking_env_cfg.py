@@ -5,10 +5,10 @@ Base factory function for end-effector trajectory tracking.
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.managers.action_manager import ActionTermCfg
-from mjlab.envs.mdp.actions import RelativeJointPositionActionCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
+from mjlab.managers.event_manager import EventTermCfg
 from mjlab.scene import SceneCfg
 from mjlab.sim import MujocoCfg, SimulationCfg
 from mjlab.terrains import TerrainEntityCfg
@@ -23,7 +23,6 @@ _HAND = SceneEntityCfg("robot", body_names=("hand",))
 
 def _proprio_actor_obs() -> dict[str, ObservationTermCfg]:
     return {
-        # Robot state (noisy — what real sensors would give).
         "ee_pos_w": ObservationTermCfg(
             func=mdp.observations.ee_pos_w,
             params={"asset_cfg": _HAND},
@@ -52,6 +51,8 @@ def _proprio_actor_obs() -> dict[str, ObservationTermCfg]:
         "traj_pos_ref": ObservationTermCfg(func=mdp.observations.traj_pos_ref),
         "traj_vel_ref": ObservationTermCfg(func=mdp.observations.traj_vel_ref),
         "traj_phase": ObservationTermCfg(func=mdp.observations.traj_phase),
+        "traj_quat_ref": ObservationTermCfg(func=mdp.observations.traj_quat_ref),
+        "traj_omega_ref": ObservationTermCfg(func=mdp.observations.traj_omega_ref),
         "traj_lookahead": ObservationTermCfg(func=mdp.observations.traj_lookahead),
     }
 
@@ -73,6 +74,8 @@ def _proprio_critic_obs() -> dict[str, ObservationTermCfg]:
         "traj_pos_ref": ObservationTermCfg(func=mdp.observations.traj_pos_ref),
         "traj_vel_ref": ObservationTermCfg(func=mdp.observations.traj_vel_ref),
         "traj_phase": ObservationTermCfg(func=mdp.observations.traj_phase),
+        "traj_quat_ref": ObservationTermCfg(func=mdp.observations.traj_quat_ref),
+        "traj_omega_ref": ObservationTermCfg(func=mdp.observations.traj_omega_ref),
         "traj_lookahead": ObservationTermCfg(func=mdp.observations.traj_lookahead),
     }
 
@@ -97,14 +100,31 @@ def make_ee_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
     }
 
     actions: dict[str, ActionTermCfg] = {
-        "joint_pos": RelativeJointPositionActionCfg(
+        "joint_pos": mdp.actions.DelayedRelativeJointPositionActionCfg(
             entity_name="robot",
             actuator_names=("joint[1-7]",),
             scale=0.5,
+            min_lag=1,
+            max_lag=5,
         )
     }
 
     rewards: dict[str, RewardTermCfg] = {
+        "tracking_pos": RewardTermCfg(
+            func=mdp.rewards.pos_reward,
+            weight=2.0,
+            params={"asset_cfg": _HAND, "alpha": 50.00},
+        ),
+        "tracking_ori": RewardTermCfg(
+            func=mdp.rewards.orientation_reward,
+            weight=0.5,
+            params={"asset_cfg": _HAND, "beta": 5.0},
+        ),
+        "tracking_vel": RewardTermCfg(
+            func=mdp.rewards.velocity_alignment_reward,
+            weight=0.3,
+            params={"asset_cfg": _HAND},
+        ),
         "action_rate_l2": RewardTermCfg(func=mdp.action_rate_l2, weight=-0.01),
     }
 
@@ -119,6 +139,8 @@ def make_ee_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
         ),
     }
 
+    reset = {"reset_robot": EventTermCfg(func=mdp.events.reset_home, mode="reset")}
+
     terminations: dict[str, TerminationTermCfg] = {
         "time_out": TerminationTermCfg(func=mdp.time_out, time_out=True),
     }
@@ -132,7 +154,7 @@ def make_ee_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
         observations=observations,
         actions=actions,
         commands=commands,
-        events={},
+        events=reset,
         rewards=rewards,
         terminations=terminations,
         curriculum={},

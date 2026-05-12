@@ -1,4 +1,4 @@
-"""Action terms for the getup task."""
+"""Action terms for the EE tracking task."""
 
 from __future__ import annotations
 
@@ -7,49 +7,56 @@ from typing import TYPE_CHECKING
 
 import torch
 from mjlab.envs.mdp.actions.actions import (
-  RelativeJointPositionAction,
-  RelativeJointPositionActionCfg,
+    RelativeJointPositionAction,
+    RelativeJointPositionActionCfg,
 )
+from mjlab.utils.buffers import DelayBuffer
 
 if TYPE_CHECKING:
-  from mjlab.envs import ManagerBasedRlEnv
+    from mjlab.envs import ManagerBasedRlEnv
 
 
 @dataclass(kw_only=True)
-class SettleRelativeJointPositionActionCfg(RelativeJointPositionActionCfg):
-  """RelativeJointPositionActionCfg that disables actions for the first N steps.
+class DelayedRelativeJointPositionActionCfg(RelativeJointPositionActionCfg):
+    """Relative joint position control with stochastic action delay.
 
-  Since the robot is dropped from a height in a random configuration, actions are
-  suppressed until ``settle_steps`` env steps have passed, allowing the robot to land
-  and settle before the policy takes over.
-  """
+    A DelayBuffer holds the last ``max_lag + 1`` raw policy outputs per env
+    and serves one delayed by a lag sampled uniformly in
+    ``[min_lag, max_lag]`` at each control step. Simulates the latency of a
+    real control stack (sim2real source of uncertainty).
+    """
 
-  settle_steps: int = 0
-  """Number of env steps after reset during which the policy action is ignored and the
-  robot holds its current position. Set to 0 to disable."""
+    min_lag: int = 1
+    """Minimum action delay in control steps."""
 
-  def build(self, env: ManagerBasedRlEnv) -> SettleRelativeJointPositionAction:
-    return SettleRelativeJointPositionAction(self, env)
+    max_lag: int = 5
+    """Maximum action delay in control steps."""
+
+    def build(self, env: ManagerBasedRlEnv) -> DelayedRelativeJointPositionAction:
+        return DelayedRelativeJointPositionAction(self, env)
 
 
-class SettleRelativeJointPositionAction(RelativeJointPositionAction):
-  """RelativeJointPositionAction that disables actions for the first N steps."""
+class DelayedRelativeJointPositionAction(RelativeJointPositionAction):
+    """RelativeJointPositionAction wrapped in a stochastic delay buffer."""
 
-  def __init__(
-    self,
-    cfg: SettleRelativeJointPositionActionCfg,
-    env: ManagerBasedRlEnv,
-  ):
-    super().__init__(cfg=cfg, env=env)
-    self._settle_steps = cfg.settle_steps
+    def __init__(
+        self,
+        cfg: DelayedRelativeJointPositionActionCfg,
+        env: ManagerBasedRlEnv,
+    ):
+        super().__init__(cfg=cfg, env=env)
+        self._delay_buf = DelayBuffer(
+            min_lag=cfg.min_lag,
+            max_lag=cfg.max_lag,
+            batch_size=env.num_envs,
+            device=str(env.device),
+        )
 
-  def apply_actions(self) -> None:
-    current_pos = self._entity.data.joint_pos[:, self._target_ids]
-    encoder_bias = self._entity.data.encoder_bias[:, self._target_ids]
-    target = current_pos + self._raw_actions * self._scale - encoder_bias
-    if self._settle_steps > 0:
-      in_window = self._env.episode_length_buf < self._settle_steps
-      was_fallen = self._env.extras.get("settle_mask", in_window)
-      settling = (in_window & was_fallen).unsqueeze(-1)
-      target = torch.where(settling, current_pos - encoder_bias, target)
-    self._entity.set_joint_position_target(target, joint_ids=self._target_ids)
+    def process_actions(self, actions: torch.Tensor) -> None:
+        self._delay_buf.append(actions)
+        delayed = self._delay_buf.compute()
+        super().process_actions(delayed)
+
+    def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+        super().reset(env_ids)
+        self._delay_buf.reset(batch_ids=env_ids)

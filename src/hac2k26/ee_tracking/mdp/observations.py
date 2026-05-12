@@ -72,8 +72,22 @@ def traj_phase(
     return env.command_manager.get_command(command_name)[:, 6:7]
 
 
+def traj_quat_ref(
+    env: ManagerBasedRlEnv, command_name: str = "trajectory"
+) -> torch.Tensor:
+    """Target EE quaternion (wxyz). Shape (N, 4)."""
+    return env.command_manager.get_command(command_name)[:, 7:11]
+
+
+def traj_omega_ref(
+    env: ManagerBasedRlEnv, command_name: str = "trajectory"
+) -> torch.Tensor:
+    """Target EE angular velocity (rad/s, world frame). Shape (N, 3)."""
+    return env.command_manager.get_command(command_name)[:, 11:14]
+
+
 def traj_lookahead(
     env: ManagerBasedRlEnv, command_name: str = "trajectory"
 ) -> torch.Tensor:
     """Flattened future reference positions. Shape (N, 3 * lookahead_steps)."""
-    return env.command_manager.get_command(command_name)[:, 7:]
+    return env.command_manager.get_command(command_name)[:, 14:]
