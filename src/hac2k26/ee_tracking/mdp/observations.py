@@ -49,3 +49,31 @@ def ee_rot6d_w(
     rotq = asset.data.body_link_quat_w[:, body_ids[0], :]
     rotm = matrix_from_quat(rotq)  # (N,..., 3, 3)
     return _rot6d_from_matrix(rotm)
+
+
+def traj_pos_ref(
+    env: ManagerBasedRlEnv, command_name: str = "trajectory"
+) -> torch.Tensor:
+    """Current target EE position from the trajectory command. Shape (N, 3)."""
+    return env.command_manager.get_command(command_name)[:, 0:3]
+
+
+def traj_vel_ref(
+    env: ManagerBasedRlEnv, command_name: str = "trajectory"
+) -> torch.Tensor:
+    """Current target EE velocity from the trajectory command. Shape (N, 3)."""
+    return env.command_manager.get_command(command_name)[:, 3:6]
+
+
+def traj_phase(
+    env: ManagerBasedRlEnv, command_name: str = "trajectory"
+) -> torch.Tensor:
+    """Phase variable phi in [0, 1]. Shape (N, 1)."""
+    return env.command_manager.get_command(command_name)[:, 6:7]
+
+
+def traj_lookahead(
+    env: ManagerBasedRlEnv, command_name: str = "trajectory"
+) -> torch.Tensor:
+    """Flattened future reference positions. Shape (N, 3 * lookahead_steps)."""
+    return env.command_manager.get_command(command_name)[:, 7:]
