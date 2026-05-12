@@ -69,8 +69,9 @@ class EETrackingCommand(CommandTerm):
         self._phase = torch.zeros(self.num_envs, 1, device=self.device)
         self._lookahead = torch.zeros(self.num_envs, self.L * 3, device=self.device)
 
-        # Concatenated command tensor (kept up to date in _update_command).
-        cmd_dim = (3 + 3 + 1 + 3) * self.L
+        cmd_dim = (
+            3 + 3 + 1 + 3 * self.L
+        )  # p_ref(3) + v_ref(3) + phase(1) + lookahead(L*3)
         self._command = torch.zeros(self.num_envs, cmd_dim, device=self.device)
 
     @property
