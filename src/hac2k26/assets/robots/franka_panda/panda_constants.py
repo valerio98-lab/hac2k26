@@ -5,10 +5,14 @@ from mjlab.entity import EntityArticulationInfoCfg, EntityCfg
 
 
 def get_spec() -> mujoco.MjSpec:
-    return mujoco.MjSpec.from_file(panda_mj_description.MJCF_PATH)
+    spec = mujoco.MjSpec.from_file(panda_mj_description.MJCF_PATH)
+    for act in list(spec.actuators):
+        spec.delete(act)
+    for key in list(spec.keys):
+        spec.delete(key)
+    return spec
 
 
-# Gains match MuJoCo Menagerie franka_emika_panda/panda.xml.
 PANDA_ACTUATOR_12 = BuiltinPositionActuatorCfg(
     target_names_expr=("joint1", "joint2"),
     stiffness=4500.0,
@@ -33,8 +37,21 @@ PANDA_ACTUATOR_567 = BuiltinPositionActuatorCfg(
     armature=0.1,
 )
 
+PANDA_ACTUATOR_FINGERS = BuiltinPositionActuatorCfg(
+    target_names_expr=("finger_joint1", "finger_joint2"),
+    stiffness=200.0,
+    damping=20.0,
+    effort_limit=20.0,
+    armature=0.01,
+)
+
 PANDA_ARTICULATION = EntityArticulationInfoCfg(
-    actuators=(PANDA_ACTUATOR_12, PANDA_ACTUATOR_34, PANDA_ACTUATOR_567),
+    actuators=(
+        PANDA_ACTUATOR_12,
+        PANDA_ACTUATOR_34,
+        PANDA_ACTUATOR_567,
+        PANDA_ACTUATOR_FINGERS,
+    ),
     soft_joint_pos_limit_factor=0.9,
 )
 
