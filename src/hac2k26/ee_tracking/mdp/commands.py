@@ -69,6 +69,8 @@ class EETrackingCommand(CommandTerm):
         self._radius_end = float(cfg.radius_end)
         self._ori_radius_start = float(cfg.ori_radius_start)
         self._ori_radius_end = float(cfg.ori_radius_end)
+        self._vel_scale_start = float(cfg.vel_scale_start)
+        self._vel_scale_end = float(cfg.vel_scale_end)
         self._curriculum_steps = max(1, int(cfg.curriculum_steps))
         self._asset_name = cfg.asset_name
         self._body_name = cfg.body_name
@@ -111,6 +113,9 @@ class EETrackingCommand(CommandTerm):
         ori_radius = self._ori_radius_start + progress * (
             self._ori_radius_end - self._ori_radius_start
         )
+        vel_scale = self._vel_scale_start + progress * (
+            self._vel_scale_end - self._vel_scale_start
+        )
 
         asset = self._env.scene[self._asset_name]
         ee_pos = asset.data.body_link_pos_w[env_ids, self._body_id, :]  # (n, 3)
@@ -125,17 +130,34 @@ class EETrackingCommand(CommandTerm):
             wps[:, 0, :] = ee_pos
 
         T = self.T_seg
-        T3 = T * T * T
+        T2 = T * T
+        T3 = T2 * T
         T4 = T3 * T
         T5 = T4 * T
-        dp = wps[:, 1:, :] - wps[:, :-1, :]  # (n, K-1, 3)
-        zeros_seg = torch.zeros_like(dp)
-        c0 = wps[:, :-1, :]
-        c1 = zeros_seg
-        c2 = zeros_seg
-        c3 = 10.0 * dp / T3
-        c4 = -15.0 * dp / T4
-        c5 = 6.0 * dp / T5
+
+        wp_vels = torch.zeros_like(wps)  # (n, K, 3), endpoints stay 0
+        if self.K >= 3 and vel_scale > 0.0:
+            # alpha ~ U(0, vel_scale) per env.
+            alpha = vel_scale * torch.rand(n, 1, 1, device=self.device)
+            # Interior tangent v_i = alpha * (p_{i+1} - p_{i-1}) / (2 T)
+            wp_vels[:, 1:-1, :] = alpha * ((wps[:, 2:, :] - wps[:, :-2, :]) / (2.0 * T))
+
+        # Quintic with BCs (p_i, v_i, a=0) -> (p_{i+1}, v_{i+1}, a=0).
+        p_i = wps[:, :-1, :]
+        p_ip1 = wps[:, 1:, :]
+        v_i = wp_vels[:, :-1, :]
+        v_ip1 = wp_vels[:, 1:, :]
+
+        dp = p_ip1 - p_i - v_i * T
+        dv = v_ip1 - v_i
+
+        c0 = p_i
+        c1 = v_i
+        c2 = torch.zeros_like(p_i)
+        c3 = 10.0 * dp / T3 - 4.0 * dv / T2
+        c4 = -15.0 * dp / T4 + 7.0 * dv / T3
+        c5 = 6.0 * dp / T5 - 3.0 * dv / T4
+
         coeffs = torch.stack([c0, c1, c2, c3, c4, c5], dim=2)  # (n, K-1, 6, 3)
         self._coeffs[env_ids] = coeffs
 
@@ -277,6 +299,17 @@ class EETrackingCommandCfg(CommandTermCfg):
     ori_radius_end: float = 0.80
     """Final max angular perturbation (rad) after curriculum ramp-up
     (~45 deg). Kept moderate so targets stay reachable for the arm."""
+
+    vel_scale_start: float = 0.0
+    """Initial through-velocity scale. v_i at an interior waypoint is
+    ``alpha * (p_{i+1} - p_{i-1}) / (2 T_seg)`` with alpha sampled in
+    [0, vel_scale]. ``vel_scale=0`` reduces to pure rest-to-rest
+    (matches the prior training-time behaviour)."""
+
+    vel_scale_end: float = 0.0
+    """Final through-velocity scale. Recommend ramping to ~0.6-0.8 over
+    the curriculum so the policy is exposed to non-zero waypoint
+    velocities late in training."""
 
     curriculum_steps: int = 2_000_000
     """Number of env-steps over which radius linearly ramps from start to end."""

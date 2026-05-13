@@ -62,8 +62,7 @@ def _proprio_actor_obs() -> dict[str, ObservationTermCfg]:
         "traj_rot6d_ref": ObservationTermCfg(func=mdp.observations.traj_rot6d_ref),
         "traj_phase": ObservationTermCfg(func=mdp.observations.traj_phase),
         "traj_lookahead": ObservationTermCfg(func=mdp.observations.traj_lookahead),
-        # Explicit tracking errors — the biggest single speed-up for tracking
-        # tasks; saves the network from learning the subtraction.
+        # Explicit tracking errors
         "pos_error_w": ObservationTermCfg(
             func=mdp.observations.pos_error_w, params={"asset_cfg": _HAND}
         ),
@@ -75,6 +74,11 @@ def _proprio_actor_obs() -> dict[str, ObservationTermCfg]:
         ),
         "ang_vel_error_w": ObservationTermCfg(
             func=mdp.observations.ang_vel_error_w, params={"asset_cfg": _HAND}
+        ),
+        # Singularity awareness: linear manipulability w(q).
+        "manipulability": ObservationTermCfg(
+            func=mdp.kinematics.manipulability,
+            params={"asset_cfg": _HAND, "joint_pattern": "joint[1-7]"},
         ),
     }
 
@@ -117,6 +121,10 @@ def _proprio_critic_obs() -> dict[str, ObservationTermCfg]:
         "ang_vel_error_w": ObservationTermCfg(
             func=mdp.observations.ang_vel_error_w, params={"asset_cfg": _HAND}
         ),
+        "manipulability": ObservationTermCfg(
+            func=mdp.kinematics.manipulability,
+            params={"asset_cfg": _HAND, "joint_pattern": "joint[1-7]"},
+        ),
     }
 
 
@@ -143,10 +151,6 @@ def make_ee_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
         "joint_pos": mdp.actions.DelayedRelativeJointPositionActionCfg(
             entity_name="robot",
             actuator_names=("joint[1-7]",),
-            # Delta-joint scale. With kp~4500 and force_limit=87 Nm, the
-            # actuator saturates above |delta| ≈ 0.02 rad/substep. Cap the
-            # per-step delta to ~0.1 rad so the action distribution is
-            # mostly inside the linear regime of the PD controller.
             scale=0.1,
             min_lag=1,
             max_lag=5,
@@ -154,9 +158,6 @@ def make_ee_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
     }
 
     rewards: dict[str, RewardTermCfg] = {
-        # Two-scale kernel: gradient both far (~tens of cm) and very close
-        # (sub-cm). Replaces the prior alpha=10 kernel that saturated as soon
-        # as the EE was vaguely near the reference.
         "tracking_pos": RewardTermCfg(
             func=mdp.rewards.pos_reward,
             weight=3.0,
@@ -188,7 +189,16 @@ def make_ee_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
             },
         ),
         "action_rate_l2": RewardTermCfg(func=mdp.action_rate_l2, weight=-0.01),
-        "action_jerk_l2": RewardTermCfg(func=mdp.rewards.action_jerk_l2, weight=-0.005),
+        "action_jerk_l2": RewardTermCfg(func=mdp.rewards.action_jerk_l2, weight=-0.015),
+        "singularity_penalty": RewardTermCfg(
+            func=mdp.kinematics.singularity_penalty,
+            weight=-50.0,
+            params={
+                "asset_cfg": _HAND,
+                "joint_pattern": "joint[1-7]",
+                "w_min": 0.04,
+            },
+        ),
     }
 
     commands = {
@@ -201,10 +211,12 @@ def make_ee_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
             lookahead_dt=0.05,
             anchor_first_waypoint=True,
             radius_start=0.15,
-            radius_end=0.35,
+            radius_end=0.45,
             ori_radius_start=0.20,
             ori_radius_end=0.80,
-            curriculum_steps=36_000,
+            vel_scale_start=0.0,
+            vel_scale_end=0.8,
+            curriculum_steps=100_000,
             asset_name="robot",
             body_name="hand",
         ),
