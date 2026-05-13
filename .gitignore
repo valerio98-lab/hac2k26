@@ -23,3 +23,5 @@ scripts/
 *.md
 *.json
 *ipynb
+*.png 
+*.csv

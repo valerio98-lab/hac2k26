@@ -28,7 +28,6 @@ from mjlab.managers.command_manager import CommandTerm, CommandTermCfg
 from mjlab.utils.lab_api.math import (
     quat_box_minus,
     quat_box_plus,
-    random_orientation,
 )
 
 if TYPE_CHECKING:
@@ -65,6 +64,17 @@ class EETrackingCommand(CommandTerm):
         self._ws_low = torch.tensor(cfg.workspace_low, device=self.device)
         self._ws_high = torch.tensor(cfg.workspace_high, device=self.device)
 
+        self._anchor = bool(cfg.anchor_first_waypoint)
+        self._radius_start = float(cfg.radius_start)
+        self._radius_end = float(cfg.radius_end)
+        self._ori_radius_start = float(cfg.ori_radius_start)
+        self._ori_radius_end = float(cfg.ori_radius_end)
+        self._curriculum_steps = max(1, int(cfg.curriculum_steps))
+        self._asset_name = cfg.asset_name
+        self._body_name = cfg.body_name
+        asset = env.scene[self._asset_name]
+        self._body_id = asset.body_names.index(self._body_name)
+
         self._coeffs = torch.zeros(self.num_envs, self.n_seg, 6, 3, device=self.device)
         self._cum_times = torch.linspace(
             0.0, self.total_duration, self.K, device=self.device
@@ -82,14 +92,37 @@ class EETrackingCommand(CommandTerm):
         return self._command
 
     def _resample_command(self, env_ids: torch.Tensor) -> None:
-        """Sample K random waypoints (position + orientation) and precompute
-        per-segment trajectory state for the given envs."""
+        """Sample K waypoints (position + orientation) and precompute
+        per-segment trajectory state for the given envs.
+
+        Curriculum: waypoints[1:] are sampled in a ±r cube around the current
+        EE position (clamped to workspace), where r linearly ramps from
+        ``radius_start`` to ``radius_end`` over ``curriculum_steps`` env-steps.
+        If ``anchor_first_waypoint`` is True, waypoints[0] is the current EE
+        pose (so the trajectory starts with zero initial error)."""
         n = int(env_ids.numel())
         if n == 0:
             return
 
+        progress = min(
+            1.0, float(self._env.common_step_counter) / self._curriculum_steps
+        )
+        radius = self._radius_start + progress * (self._radius_end - self._radius_start)
+        ori_radius = self._ori_radius_start + progress * (
+            self._ori_radius_end - self._ori_radius_start
+        )
+
+        asset = self._env.scene[self._asset_name]
+        ee_pos = asset.data.body_link_pos_w[env_ids, self._body_id, :]  # (n, 3)
+        ee_quat = asset.data.body_link_quat_w[env_ids, self._body_id, :]  # (n, 4)
+
         u = torch.rand(n, self.K, 3, device=self.device)
-        wps = self._ws_low + u * (self._ws_high - self._ws_low)  # (n, K, 3)
+        wps_box = ee_pos.unsqueeze(1) + (2.0 * u - 1.0) * radius  # (n, K, 3)
+        wps = torch.minimum(torch.maximum(wps_box, self._ws_low), self._ws_high)
+
+        if self._anchor:
+            wps = wps.clone()
+            wps[:, 0, :] = ee_pos
 
         T = self.T_seg
         T3 = T * T * T
@@ -106,9 +139,15 @@ class EETrackingCommand(CommandTerm):
         coeffs = torch.stack([c0, c1, c2, c3, c4, c5], dim=2)  # (n, K-1, 6, 3)
         self._coeffs[env_ids] = coeffs
 
-        wps_q = random_orientation(n * self.K, device=str(self.device)).reshape(
-            n, self.K, 4
-        )
+        rand_dir = torch.randn(n, self.K, 3, device=self.device)
+        rand_dir = rand_dir / (rand_dir.norm(dim=-1, keepdim=True) + 1e-8)
+        rand_mag = ori_radius * torch.rand(n, self.K, 1, device=self.device)
+        deltas = (rand_dir * rand_mag).reshape(n * self.K, 3)
+        ee_quat_rep = ee_quat.unsqueeze(1).expand(n, self.K, 4).reshape(n * self.K, 4)
+        wps_q = quat_box_plus(ee_quat_rep, deltas).reshape(n, self.K, 4)
+        if self._anchor:
+            wps_q = wps_q.clone()
+            wps_q[:, 0, :] = ee_quat
 
         q_i = wps_q[:, :-1, :].reshape(n * self.n_seg, 4)
         q_iplus1 = wps_q[:, 1:, :].reshape(n * self.n_seg, 4)
@@ -218,6 +257,35 @@ class EETrackingCommandCfg(CommandTermCfg):
 
     lookahead_dt: float = 0.05
     """Time delta between consecutive lookahead samples (s)."""
+
+    anchor_first_waypoint: bool = True
+    """If True, the first waypoint of every sampled trajectory is the current
+    EE pose (pos + quat), so the trajectory starts with zero initial error."""
+
+    radius_start: float = 0.05
+    """Initial half-edge (m) of the cube around the current EE position from
+    which subsequent waypoints are sampled. Trajectories then get clamped to
+    [workspace_low, workspace_high]."""
+
+    radius_end: float = 0.30
+    """Final half-edge (m) of the sampling cube after curriculum ramp-up."""
+
+    ori_radius_start: float = 0.15
+    """Initial max angular perturbation (rad) of waypoint quaternions around
+    the current EE orientation."""
+
+    ori_radius_end: float = 0.80
+    """Final max angular perturbation (rad) after curriculum ramp-up
+    (~45 deg). Kept moderate so targets stay reachable for the arm."""
+
+    curriculum_steps: int = 2_000_000
+    """Number of env-steps over which radius linearly ramps from start to end."""
+
+    asset_name: str = "robot"
+    """Scene entity to query for the EE pose at resample time."""
+
+    body_name: str = "hand"
+    """Body of ``asset_name`` whose world-frame pose anchors the trajectory."""
 
     resampling_time_range: tuple[float, float] = field(default=(0.0, 0.0))
     """Auto-set in __post_init__ to match trajectory total duration."""

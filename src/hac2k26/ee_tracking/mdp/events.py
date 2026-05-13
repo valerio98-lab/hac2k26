@@ -38,3 +38,5 @@ def reset_home(
     joint_hom_vel = torch.zeros(size=(n, J + 2), device=env.device)
 
     asset.write_joint_state_to_sim(joint_home_pos, joint_hom_vel, env_ids=env_ids)
+
+    env.sim.forward()

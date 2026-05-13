@@ -19,6 +19,8 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 from hac2k26.ee_tracking import mdp
 
 _HAND = SceneEntityCfg("robot", body_names=("hand",))
+_ARM = SceneEntityCfg("robot", joint_names=("joint[1-7]",))
+_HAND_ARM = SceneEntityCfg("robot", body_names=("hand",), joint_names=("joint[1-7]",))
 
 
 def _proprio_actor_obs() -> dict[str, ObservationTermCfg]:
@@ -33,6 +35,11 @@ def _proprio_actor_obs() -> dict[str, ObservationTermCfg]:
             params={"asset_cfg": _HAND},
             noise=Unoise(n_min=-0.05, n_max=0.05),
         ),
+        "ee_ang_vel_w": ObservationTermCfg(
+            func=mdp.observations.ee_ang_vel_w,
+            params={"asset_cfg": _HAND},
+            noise=Unoise(n_min=-0.1, n_max=0.1),
+        ),
         "ee_rot6d_w": ObservationTermCfg(
             func=mdp.observations.ee_rot6d_w,
             params={"asset_cfg": _HAND},
@@ -41,19 +48,34 @@ def _proprio_actor_obs() -> dict[str, ObservationTermCfg]:
         "joint_pos": ObservationTermCfg(
             func=mdp.joint_pos_rel,
             noise=Unoise(n_min=-0.03, n_max=0.03),
-            params={"biased": True},
+            params={"biased": True, "asset_cfg": _ARM},
         ),
         "joint_vel": ObservationTermCfg(
             func=mdp.joint_vel_rel,
-            noise=Unoise(n_min=-1.5, n_max=1.5),
+            noise=Unoise(n_min=-0.1, n_max=0.1),
+            params={"asset_cfg": _ARM},
         ),
         "actions": ObservationTermCfg(func=mdp.last_action),
+        # Reference signal.
         "traj_pos_ref": ObservationTermCfg(func=mdp.observations.traj_pos_ref),
         "traj_vel_ref": ObservationTermCfg(func=mdp.observations.traj_vel_ref),
+        "traj_rot6d_ref": ObservationTermCfg(func=mdp.observations.traj_rot6d_ref),
         "traj_phase": ObservationTermCfg(func=mdp.observations.traj_phase),
-        "traj_quat_ref": ObservationTermCfg(func=mdp.observations.traj_quat_ref),
-        "traj_omega_ref": ObservationTermCfg(func=mdp.observations.traj_omega_ref),
         "traj_lookahead": ObservationTermCfg(func=mdp.observations.traj_lookahead),
+        # Explicit tracking errors — the biggest single speed-up for tracking
+        # tasks; saves the network from learning the subtraction.
+        "pos_error_w": ObservationTermCfg(
+            func=mdp.observations.pos_error_w, params={"asset_cfg": _HAND}
+        ),
+        "lin_vel_error_w": ObservationTermCfg(
+            func=mdp.observations.lin_vel_error_w, params={"asset_cfg": _HAND}
+        ),
+        "rot_error_rotvec": ObservationTermCfg(
+            func=mdp.observations.rot_error_rotvec, params={"asset_cfg": _HAND}
+        ),
+        "ang_vel_error_w": ObservationTermCfg(
+            func=mdp.observations.ang_vel_error_w, params={"asset_cfg": _HAND}
+        ),
     }
 
 
@@ -65,18 +87,36 @@ def _proprio_critic_obs() -> dict[str, ObservationTermCfg]:
         "ee_lin_vel_w": ObservationTermCfg(
             func=mdp.observations.ee_lin_vel_w, params={"asset_cfg": _HAND}
         ),
+        "ee_ang_vel_w": ObservationTermCfg(
+            func=mdp.observations.ee_ang_vel_w, params={"asset_cfg": _HAND}
+        ),
         "ee_rot6d_w": ObservationTermCfg(
             func=mdp.observations.ee_rot6d_w, params={"asset_cfg": _HAND}
         ),
-        "joint_pos": ObservationTermCfg(func=mdp.joint_pos_rel),
-        "joint_vel": ObservationTermCfg(func=mdp.joint_vel_rel),
+        "joint_pos": ObservationTermCfg(
+            func=mdp.joint_pos_rel, params={"asset_cfg": _ARM}
+        ),
+        "joint_vel": ObservationTermCfg(
+            func=mdp.joint_vel_rel, params={"asset_cfg": _ARM}
+        ),
         "actions": ObservationTermCfg(func=mdp.last_action),
         "traj_pos_ref": ObservationTermCfg(func=mdp.observations.traj_pos_ref),
         "traj_vel_ref": ObservationTermCfg(func=mdp.observations.traj_vel_ref),
+        "traj_rot6d_ref": ObservationTermCfg(func=mdp.observations.traj_rot6d_ref),
         "traj_phase": ObservationTermCfg(func=mdp.observations.traj_phase),
-        "traj_quat_ref": ObservationTermCfg(func=mdp.observations.traj_quat_ref),
-        "traj_omega_ref": ObservationTermCfg(func=mdp.observations.traj_omega_ref),
         "traj_lookahead": ObservationTermCfg(func=mdp.observations.traj_lookahead),
+        "pos_error_w": ObservationTermCfg(
+            func=mdp.observations.pos_error_w, params={"asset_cfg": _HAND}
+        ),
+        "lin_vel_error_w": ObservationTermCfg(
+            func=mdp.observations.lin_vel_error_w, params={"asset_cfg": _HAND}
+        ),
+        "rot_error_rotvec": ObservationTermCfg(
+            func=mdp.observations.rot_error_rotvec, params={"asset_cfg": _HAND}
+        ),
+        "ang_vel_error_w": ObservationTermCfg(
+            func=mdp.observations.ang_vel_error_w, params={"asset_cfg": _HAND}
+        ),
     }
 
 
@@ -103,43 +143,104 @@ def make_ee_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
         "joint_pos": mdp.actions.DelayedRelativeJointPositionActionCfg(
             entity_name="robot",
             actuator_names=("joint[1-7]",),
-            scale=0.5,
+            # Delta-joint scale. With kp~4500 and force_limit=87 Nm, the
+            # actuator saturates above |delta| ≈ 0.02 rad/substep. Cap the
+            # per-step delta to ~0.1 rad so the action distribution is
+            # mostly inside the linear regime of the PD controller.
+            scale=0.1,
             min_lag=1,
             max_lag=5,
         )
     }
 
     rewards: dict[str, RewardTermCfg] = {
+        # Two-scale kernel: gradient both far (~tens of cm) and very close
+        # (sub-cm). Replaces the prior alpha=10 kernel that saturated as soon
+        # as the EE was vaguely near the reference.
         "tracking_pos": RewardTermCfg(
             func=mdp.rewards.pos_reward,
-            weight=2.0,
-            params={"asset_cfg": _HAND, "alpha": 50.00},
+            weight=3.0,
+            params={
+                "asset_cfg": _HAND,
+                "alpha_coarse": 30.0,
+                "alpha_fine": 400.0,
+                "fine_weight": 0.5,
+            },
         ),
-        "tracking_ori": RewardTermCfg(
-            func=mdp.rewards.orientation_reward,
-            weight=0.5,
-            params={"asset_cfg": _HAND, "beta": 5.0},
+        "tracking_pos_l2": RewardTermCfg(
+            func=mdp.rewards.pos_error_l2_penalty,
+            weight=-1.0,
+            params={"asset_cfg": _HAND},
         ),
         "tracking_vel": RewardTermCfg(
             func=mdp.rewards.velocity_alignment_reward,
-            weight=0.3,
+            weight=0.5,
             params={"asset_cfg": _HAND},
         ),
+        "tracking_ori": RewardTermCfg(
+            func=mdp.rewards.orientation_reward,
+            weight=1.0,
+            params={
+                "asset_cfg": _HAND,
+                "beta_coarse": 2.0,
+                "beta_fine": 20.0,
+                "fine_weight": 0.5,
+            },
+        ),
         "action_rate_l2": RewardTermCfg(func=mdp.action_rate_l2, weight=-0.01),
+        "action_jerk_l2": RewardTermCfg(func=mdp.rewards.action_jerk_l2, weight=-0.005),
     }
 
     commands = {
         "trajectory": mdp.commands.EETrackingCommandCfg(
             num_waypoints=5,
             segment_duration=1.5,
-            workspace_low=(0.30, -0.30, 0.20),
-            workspace_high=(0.60, 0.30, 0.60),
+            workspace_low=(0.20, -0.40, 0.10),
+            workspace_high=(0.70, 0.40, 0.80),
             lookahead_steps=5,
             lookahead_dt=0.05,
+            anchor_first_waypoint=True,
+            radius_start=0.15,
+            radius_end=0.35,
+            ori_radius_start=0.20,
+            ori_radius_end=0.80,
+            curriculum_steps=36_000,
+            asset_name="robot",
+            body_name="hand",
         ),
     }
-
-    reset = {"reset_robot": EventTermCfg(func=mdp.events.reset_home, mode="reset")}
+    _DR_BODIES = SceneEntityCfg(
+        "robot",
+        body_names=(
+            "link2",
+            "link3",
+            "link4",
+            "link5",
+            "link6",
+            "link7",
+            "hand",
+            "left_finger",
+            "right_finger",
+        ),
+    )
+    _DR_ARM_JOINTS = SceneEntityCfg("robot", joint_names=("joint[1-7]",))
+    events = {
+        "reset_robot": EventTermCfg(func=mdp.events.reset_home, mode="reset"),
+        "dr_pseudo_inertia": EventTermCfg(
+            func=mdp.dr.pseudo_inertia,
+            mode="startup",
+            params={"alpha_range": (-0.07, 0.07), "asset_cfg": _DR_BODIES},
+        ),
+        "dr_joint_friction": EventTermCfg(
+            func=mdp.dr.joint_friction,
+            mode="startup",
+            params={
+                "ranges": (0.0, 0.2),
+                "operation": "abs",
+                "asset_cfg": _DR_ARM_JOINTS,
+            },
+        ),
+    }
 
     terminations: dict[str, TerminationTermCfg] = {
         "time_out": TerminationTermCfg(func=mdp.time_out, time_out=True),
@@ -154,7 +255,7 @@ def make_ee_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
         observations=observations,
         actions=actions,
         commands=commands,
-        events=reset,
+        events=events,
         rewards=rewards,
         terminations=terminations,
         curriculum={},
@@ -168,7 +269,7 @@ def make_ee_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
             azimuth=90.0,
         ),
         sim=SimulationCfg(
-            njmax=200,
+            njmax=500,
             mujoco=MujocoCfg(
                 timestep=0.005,
                 iterations=10,

@@ -1,16 +1,3 @@
-"""Quintic spline trajectory math.
-
-Pure PyTorch. Operates on vector waypoints (typical use: 3D EE positions). The
-piecewise spline chains quintic segments — each segment is a degree-5
-polynomial parameterized by boundary position, velocity and acceleration. Six
-boundary conditions per segment determine six coefficients in closed form.
-
-Coefficients live in a (6, D) tensor: rows c0..c5, columns the spatial dims.
-
-Device convention: tensors stay on the device of the inputs. Pass CPU tensors
-in plot/test scripts; pass GPU tensors when integrating into the command.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -81,12 +68,9 @@ def evaluate_segment(
         scalar = True
         t_tensor = torch.tensor([float(t)], device=device, dtype=dtype)
 
-    # Power matrix: row i = t^i, shape (6, N).
     powers = torch.stack([t_tensor**i for i in range(6)], dim=0)
-
     # Position. powers.T: (N, 6); coeffs: (6, D).
     pos = powers.T @ coeffs  # (N, D)
-
     # Derivative coefficients
     vel_coeffs = torch.stack(
         [(i + 1) * coeffs[i + 1] for i in range(5)], dim=0
