@@ -129,6 +129,10 @@ class EETrackingCommand(CommandTerm):
             wps = wps.clone()
             wps[:, 0, :] = ee_pos
 
+        # Centripetal Catmull-Rom velocities for INTERIOR waypoints; v=0 at
+        # the two endpoints so trajectories always start and end at rest.
+        # alpha is sampled per trajectory (one shared scale per env), so the
+        # whole trajectory uses a consistent through-speed.
         T = self.T_seg
         T2 = T * T
         T3 = T2 * T
