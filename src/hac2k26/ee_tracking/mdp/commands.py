@@ -65,8 +65,12 @@ class EETrackingCommand(CommandTerm):
         self._ws_high = torch.tensor(cfg.workspace_high, device=self.device)
 
         self._anchor = bool(cfg.anchor_first_waypoint)
-        self._radius_start = float(cfg.radius_start)
-        self._radius_end = float(cfg.radius_end)
+        self._r_min = float(cfg.r_min)
+        self._r_max = float(cfg.r_max)
+        self._z_min = float(cfg.z_min)
+        self._z_max = float(cfg.z_max)
+        self._dtheta_max_start = float(cfg.dtheta_max_start)
+        self._dtheta_max_end = float(cfg.dtheta_max_end)
         self._ori_radius_start = float(cfg.ori_radius_start)
         self._ori_radius_end = float(cfg.ori_radius_end)
         self._vel_scale_start = float(cfg.vel_scale_start)
@@ -109,21 +113,38 @@ class EETrackingCommand(CommandTerm):
         progress = min(
             1.0, float(self._env.common_step_counter) / self._curriculum_steps
         )
-        radius = self._radius_start + progress * (self._radius_end - self._radius_start)
+        dtheta_max = self._dtheta_max_start + progress * (
+            self._dtheta_max_end - self._dtheta_max_start
+        )
         ori_radius = self._ori_radius_start + progress * (
             self._ori_radius_end - self._ori_radius_start
         )
         vel_scale = self._vel_scale_start + progress * (
             self._vel_scale_end - self._vel_scale_start
-        )
+        )  # LERP
 
         asset = self._env.scene[self._asset_name]
         ee_pos = asset.data.body_link_pos_w[env_ids, self._body_id, :]  # (n, 3)
         ee_quat = asset.data.body_link_quat_w[env_ids, self._body_id, :]  # (n, 4)
 
-        u = torch.rand(n, self.K, 3, device=self.device)
-        wps_box = ee_pos.unsqueeze(1) + (2.0 * u - 1.0) * radius  # (n, K, 3)
-        wps = torch.minimum(torch.maximum(wps_box, self._ws_low), self._ws_high)
+        curr_theta = torch.atan2(ee_pos[:, 1], ee_pos[:, 0]).unsqueeze(-1)  # (n, 1)
+        delta_theta = (
+            2.0 * torch.rand(n, self.K - 1, device=self.device) - 1.0
+        ) * dtheta_max
+        next_theta = curr_theta + torch.cat(
+            [torch.zeros(n, 1, device=self.device), torch.cumsum(delta_theta, dim=-1)],
+            dim=-1,
+        )  # (n, K) — first waypoint anchored at the EE angle
+        r_i = self._r_min + (self._r_max - self._r_min) * torch.rand(
+            n, self.K, device=self.device
+        )
+        z_i = self._z_min + (self._z_max - self._z_min) * torch.rand(
+            n, self.K, device=self.device
+        )
+        wps = torch.stack(
+            [r_i * torch.cos(next_theta), r_i * torch.sin(next_theta), z_i], dim=-1
+        )  # (n, K, 3)
+        wps = torch.minimum(torch.maximum(wps, self._ws_low), self._ws_high)
 
         if self._anchor:
             wps = wps.clone()
@@ -219,6 +240,40 @@ class EETrackingCommand(CommandTerm):
     def _update_metrics(self) -> None:
         pass
 
+    def _debug_vis_impl(self, visualizer) -> None:
+
+        for env_idx in visualizer.get_env_indices(self.num_envs):
+            N_samples = 300
+            t = torch.linspace(
+                0.0, self.total_duration, N_samples, device=self.device
+            ).unsqueeze(
+                0
+            )  # (1, N)
+            # Temporarily evaluate just this env.
+            coeffs = self._coeffs[env_idx : env_idx + 1]
+            cum = self._cum_times
+            interior = cum[1:-1]
+            seg = torch.searchsorted(
+                interior, t.clamp(0.0, self.total_duration), right=True
+            )
+            seg = seg.clamp(0, self.n_seg - 1)
+            local_t = t - cum[seg]
+            powers = torch.stack([local_t**i for i in range(6)], dim=-1)  # (1, N, 6)
+            selected = coeffs[0, seg[0]]  # (N, 6, 3)
+            pts = (
+                torch.einsum("ni,nij->nj", powers[0], selected).cpu().numpy()
+            )  # (N, 3)
+
+            for p in pts:
+                visualizer.add_sphere(
+                    center=p, radius=0.008, color=(0.2, 0.9, 0.3, 0.8)
+                )
+
+            p_ref = self._command[env_idx, 0:3].cpu().numpy()
+            visualizer.add_sphere(
+                center=p_ref, radius=0.025, color=(0.9, 0.2, 0.2, 1.0), label="p_ref"
+            )
+
     def _segment_of(self, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Map a per-env time t (N,) to (segment_index, local_time)."""
         t_clamped = t.clamp(0.0, self.total_duration)
@@ -288,13 +343,26 @@ class EETrackingCommandCfg(CommandTermCfg):
     """If True, the first waypoint of every sampled trajectory is the current
     EE pose (pos + quat), so the trajectory starts with zero initial error."""
 
-    radius_start: float = 0.05
-    """Initial half-edge (m) of the cube around the current EE position from
-    which subsequent waypoints are sampled. Trajectories then get clamped to
-    [workspace_low, workspace_high]."""
+    r_min: float = 0.25
+    """Inner radial bound (m, world XY plane from base) for waypoint sampling."""
 
-    radius_end: float = 0.30
-    """Final half-edge (m) of the sampling cube after curriculum ramp-up."""
+    r_max: float = 0.65
+    """Outer radial bound (m). Should respect the arm's reachable XY radius."""
+
+    z_min: float = 0.20
+    """Lower z bound (m). Used in addition to workspace_low[2] (the latter
+    clamps; this one biases the *sampled* distribution)."""
+
+    z_max: float = 0.65
+    """Upper z bound (m)."""
+
+    dtheta_max_start: float = 0.5
+    """Initial maximum per-segment angular increment Δθ_max (rad). With ~30°
+    the trajectory stays in a narrow angular wedge and joint1 barely moves."""
+
+    dtheta_max_end: float = 3.14
+    """Final Δθ_max (rad). At ~π the policy is exposed to consecutive
+    waypoints on opposite sides of the base, forcing joint1 rotation."""
 
     ori_radius_start: float = 0.15
     """Initial max angular perturbation (rad) of waypoint quaternions around

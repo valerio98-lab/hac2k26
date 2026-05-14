@@ -21,6 +21,7 @@ _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
 
 class _JacBuffers:
+    """Lazy-allocated warp buffers + their torch views."""
 
     __slots__ = (
         "jacp_wp",
@@ -102,6 +103,7 @@ def _local_body_id_from_buf(asset, buf: _JacBuffers) -> int:
     """Map the global body id stored in the buffer back to the asset's
     local index (used by ``asset.data.body_link_pos_w``)."""
     global_ids = asset.indexing.body_ids
+    # Linear search — only runs once per cache hit, asset has O(20) bodies.
     matches = (global_ids == buf.body_id).nonzero(as_tuple=False)
     return int(matches[0, 0].item())
 
