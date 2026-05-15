@@ -78,11 +78,11 @@ def get_panda_robot_cfg() -> EntityCfg:
     )
 
 
-if __name__ == "__main__":
+# if __name__ == "__main__":
 
-    from mjlab.entity.entity import Entity
+#     from mjlab.entity.entity import Entity
 
-    robot = Entity(get_panda_robot_cfg())
-    m = robot.spec.compile()
-    print("nq:", m.nq, " nv:", m.nv)
-    print("joints:", [m.joint(i).name for i in range(m.njnt)])
+#     robot = Entity(get_panda_robot_cfg())
+#     m = robot.spec.compile()
+#     print("nq:", m.nq, " nv:", m.nv)
+#     print("joints:", [m.joint(i).name for i in range(m.njnt)])
