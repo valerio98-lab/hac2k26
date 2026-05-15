@@ -213,7 +213,7 @@ def make_ee_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
             # ~5% of the tracking_pos signal, enough to push away from
             # singular regions but not enough to dominate trajectory
             # following.
-            weight=-300.0,  # -50
+            weight=-150.0,  # -50
             params={
                 "asset_cfg": _HAND,
                 "joint_pattern": "joint[1-7]",
@@ -227,27 +227,27 @@ def make_ee_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
             num_waypoints=5,
             segment_duration=1.0,  # 1.5
             debug_vis=True,
-            workspace_low=(0.20, -0.40, 0.10),
-            workspace_high=(0.70, 0.40, 0.80),
+            workspace_low=(-0.75, -0.75, -0.10),
+            workspace_high=(0.75, 0.75, 0.90),
             lookahead_steps=5,
             lookahead_dt=0.05,
             anchor_first_waypoint=True,
-            r_min=0.25,
-            r_max=0.65,
-            z_min=0.20,
-            z_max=0.65,
+            r_min=0.35,
+            r_max=0.75,
+            z_min=0.10,
+            z_max=0.90,
             dtheta_max_start=0.5,
             dtheta_max_end=3.14,
             ori_radius_start=0.20,
-            ori_radius_end=0.80,
+            ori_radius_end=1.40,
             # Variable waypoint velocities — rest-to-rest at the very
             # start of training, ramp to a non-trivial through-speed by the
             # end of the curriculum window. With centripetal Catmull-Rom
             # tangents and radius=0.35m, T_seg=1.5s, max |v_waypoint| stays
             # below ~0.2 m/s — well within Franka joint-velocity limits.
-            vel_scale_start=0.8,  # 0.0
-            vel_scale_end=1.2,  # 0.8
-            curriculum_steps=30_000,
+            vel_scale_start=0.0,  # 0.0
+            vel_scale_end=1.5,  # 0.8
+            curriculum_steps=130_000,
             asset_name="robot",
             body_name="hand",
         ),
