@@ -59,26 +59,36 @@ class DeterministicEETrackingCommand(CommandTerm):
         return self._command
 
     def _resample_command(self, env_ids: torch.Tensor) -> None:
-        """Re-anchor the trajectory to the current EE pose for the
-        given envs and reset their per-env time counter to zero."""
+        """Reset the per-env time counter. The trajectory anchor is set
+        lazily on the first ``_update_command`` call: ``_resample_command``
+        runs inside ``_reset_idx`` *before* the framework's ``sim.forward()``
+        pass, so ``body_link_pos_w`` here still reflects pre-reset xpos
+        (typically the all-zeros FK, ~0.9 m high) — not the freshly-written
+        home pose. By the time ``_update_command`` first fires inside
+        ``step()``, ``sim.forward()`` has run and xpos is current."""
         if env_ids.numel() == 0:
             return
-        asset = self._env.scene[self._asset_name]
-        ee_pos = asset.data.body_link_pos_w[env_ids, self._body_id, :]
-        ee_quat = asset.data.body_link_quat_w[env_ids, self._body_id, :]
-
-        anchor = TrajectoryAnchor(pos=ee_pos, quat=ee_quat)
-        self._traj.set_anchor(anchor)
         self._step_count[env_ids] = 0
 
-        # Pre-sample the full path for the ghost overlay (single-env eval).
-        t_grid = torch.linspace(
-            0.0, self._traj.T_total, self._ghost_n, device=self.device
-        )
-        p_grid, _, _, _ = self._traj.evaluate(t_grid)
-        self._ghost_points = p_grid.detach().clone()
-
     def _update_command(self) -> None:
+        # Lazy re-anchor: any env at t=0 reads the (now-current) EE pose.
+        if (self._step_count == 0).any():
+            asset = self._env.scene[self._asset_name]
+            ee_pos = asset.data.body_link_pos_w[:, self._body_id, :]
+            ee_quat = asset.data.body_link_quat_w[:, self._body_id, :]
+            print(
+                f"Anchoring trajectory at EE pos {ee_pos.cpu().numpy()}",
+                flush=True,
+            )
+            self._traj.set_anchor(TrajectoryAnchor(pos=ee_pos, quat=ee_quat))
+
+            # Pre-sample the full path for the ghost overlay (single-env eval).
+            t_grid = torch.linspace(
+                0.0, self._traj.T_total, self._ghost_n, device=self.device
+            )
+            p_grid, _, _, _ = self._traj.evaluate(t_grid)
+            self._ghost_points = p_grid.detach().clone()
+
         step_dt = self._env.step_dt
         t = self._step_count.to(dtype=torch.float32) * step_dt  # (N,)
 
@@ -125,7 +135,6 @@ class DeterministicEETrackingCommand(CommandTerm):
             label="start",
         )
 
-        # Current reference target — bigger and orange so it pops.
         cmd = self._command[0].detach().cpu().numpy()
         p_ref = cmd[0:3]
         visualizer.add_sphere(
