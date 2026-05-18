@@ -14,7 +14,6 @@ if TYPE_CHECKING:
 
 
 class OSCController:
-
     def __init__(
         self,
         env: ManagerBasedRlEnv,
