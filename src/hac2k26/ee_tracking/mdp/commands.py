@@ -2,9 +2,12 @@
 
 Generates a piecewise reference signal for the end-effector through K random
 waypoints in a configurable workspace box. Position uses rest-to-rest quintic
-splines; orientation uses SLERP between random quaternion waypoints with the
-same quintic smoothstep time-reparametrization (so angular velocity is zero at
-every waypoint, matching the position rest-to-rest behaviour).
+splines in CYLINDRICAL coordinates (r, θ, z) about the robot base z-axis —
+this way segments connecting waypoints on opposite sides of the base produce
+arcs around it rather than straight lines through it. Orientation uses SLERP
+between random quaternion waypoints with the same quintic smoothstep
+time-reparametrization (so angular velocity is zero at every waypoint,
+matching the position rest-to-rest behaviour).
 
 Internally state is fully batched over envs:
     coeffs:      (num_envs, K-1, 6, 3) — quintic coefficients per segment
@@ -66,12 +69,14 @@ class EETrackingCommand(CommandTerm):
         self._ws_high = torch.tensor(cfg.workspace_high, device=self.device)
 
         self._anchor = bool(cfg.anchor_first_waypoint)
+        self._r_min = float(cfg.r_min)
         self._radius_start = float(cfg.radius_start)
         self._radius_end = float(cfg.radius_end)
         self._ori_radius_start = float(cfg.ori_radius_start)
         self._ori_radius_end = float(cfg.ori_radius_end)
         self._vel_scale_start = float(cfg.vel_scale_start)
         self._vel_scale_end = float(cfg.vel_scale_end)
+        self._alpha_min_ratio = float(cfg.alpha_min_ratio)
         self._curriculum_steps = max(1, int(cfg.curriculum_steps))
         self._asset_name = cfg.asset_name
         self._body_name = cfg.body_name
@@ -162,26 +167,36 @@ class EETrackingCommand(CommandTerm):
             wps = wps.clone()
             wps[:, 0, :] = ee_pos
 
-        # Centripetal Catmull-Rom velocities for INTERIOR waypoints; v=0 at
-        # the two endpoints so trajectories always start and end at rest.
-        # alpha is sampled per trajectory (one shared scale per env), so the
-        # whole trajectory uses a consistent through-speed.
+        r = torch.linalg.norm(wps[..., :2], dim=-1)  # (n, K)
+        r = torch.maximum(r, torch.full_like(r, self._r_min))
+        theta = torch.atan2(wps[..., 1], wps[..., 0])  # (n, K) in (-π, π]
+
+        dtheta = theta[:, 1:] - theta[:, :-1]
+        dtheta = torch.atan2(torch.sin(dtheta), torch.cos(dtheta))
+        theta_unwrap = torch.cat(
+            [theta[:, :1], theta[:, :1] + torch.cumsum(dtheta, dim=1)], dim=1
+        )
+        wps_cyl = torch.stack([r, theta_unwrap, wps[..., 2]], dim=-1)  # (n, K, 3)
+
+        # Centripetal Catmull-Rom velocities for interior waypoints
         T = self.T_seg
         T2 = T * T
         T3 = T2 * T
         T4 = T3 * T
         T5 = T4 * T
 
-        wp_vels = torch.zeros_like(wps)  # (n, K, 3), endpoints stay 0
+        wp_vels = torch.zeros_like(wps_cyl)
         if self.K >= 3 and vel_scale > 0.0:
-            # alpha ~ U(0, vel_scale) per env.
-            alpha = vel_scale * torch.rand(n, 1, 1, device=self.device)
-            # Interior tangent v_i = alpha * (p_{i+1} - p_{i-1}) / (2 T)
-            wp_vels[:, 1:-1, :] = alpha * ((wps[:, 2:, :] - wps[:, :-2, :]) / (2.0 * T))
+            r = self._alpha_min_ratio
+            alpha = vel_scale * (
+                r + (1.0 - r) * torch.rand(n, 1, 1, device=self.device)
+            )
+            wp_vels[:, 1:-1, :] = alpha * (
+                (wps_cyl[:, 2:, :] - wps_cyl[:, :-2, :]) / (2.0 * T)
+            )
 
-        # Quintic with BCs (p_i, v_i, a=0) -> (p_{i+1}, v_{i+1}, a=0).
-        p_i = wps[:, :-1, :]
-        p_ip1 = wps[:, 1:, :]
+        p_i = wps_cyl[:, :-1, :]
+        p_ip1 = wps_cyl[:, 1:, :]
         v_i = wp_vels[:, :-1, :]
         v_ip1 = wp_vels[:, 1:, :]
 
@@ -195,7 +210,7 @@ class EETrackingCommand(CommandTerm):
         c4 = -15.0 * dp / T4 + 7.0 * dv / T3
         c5 = 6.0 * dp / T5 - 3.0 * dv / T4
 
-        coeffs = torch.stack([c0, c1, c2, c3, c4, c5], dim=2)  # (n, K-1, 6, 3)
+        coeffs = torch.stack([c0, c1, c2, c3, c4, c5], dim=2)  # (n, K-1, 6, 3) (r,θ,z)
         self._coeffs[env_ids] = coeffs
 
         rand_dir = torch.randn(n, self.K, 3, device=self.device)
@@ -217,10 +232,6 @@ class EETrackingCommand(CommandTerm):
 
     def _update_command(self) -> None:
         """Evaluate the reference signal at the current trajectory time."""
-        # Late-bind any anchors that were deferred at reset time. xpos has now
-        # been refreshed by the framework's ``sim.forward()`` (called between
-        # ``_reset_idx`` and ``command_manager.compute()`` in ``step()``), so
-        # ``body_link_pos_w`` here reflects the home pose.
         if self._anchor_dirty.any():
             dirty_ids = self._anchor_dirty.nonzero(as_tuple=False).squeeze(-1)
             self._do_resample(dirty_ids)
@@ -241,16 +252,16 @@ class EETrackingCommand(CommandTerm):
         p_look, _ = self._eval_batched(t_look)
         lookahead = p_look.reshape(self.num_envs, -1)  # (N, L*3)
 
-        seg_idx, local_t = self._segment_of(t_now)  # (N,), (N,)
+        seg_idx, local_t = self._segment_of(t_now)
         u = local_t / self.T_seg  # (N,)
-        s = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u)  # (N,)
-        s_dot = 30.0 * u * u * (1.0 - u) * (1.0 - u)  # (N,)
+        s = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u)
+        s_dot = 30.0 * u * u * (1.0 - u) * (1.0 - u)
 
         env_idx = torch.arange(self.num_envs, device=self.device)
         q_start_seg = self._q_start[env_idx, seg_idx]  # (N, 4)
         aa_seg = self._axis_angle[env_idx, seg_idx]  # (N, 3)
 
-        delta = s.unsqueeze(-1) * aa_seg  # (N, 3) — world-frame increment
+        delta = s.unsqueeze(-1) * aa_seg  # (N, 3)
         q_ref = quat_box_plus(q_start_seg, delta)  # (N, 4)
         omega_ref = (s_dot.unsqueeze(-1) / self.T_seg) * aa_seg  # (N, 3) world
 
@@ -280,10 +291,20 @@ class EETrackingCommand(CommandTerm):
             seg = seg.clamp(0, self.n_seg - 1)
             local_t = t - cum[seg]
             powers = torch.stack([local_t**i for i in range(6)], dim=-1)  # (1, N, 6)
-            selected = coeffs[0, seg[0]]  # (N, 6, 3)
+            selected = coeffs[0, seg[0]]  # (N, 6, 3) in (r, θ, z)
+            pts_cyl = torch.einsum("ni,nij->nj", powers[0], selected)  # (N, 3)
             pts = (
-                torch.einsum("ni,nij->nj", powers[0], selected).cpu().numpy()
-            )  # (N, 3)
+                torch.stack(
+                    [
+                        pts_cyl[:, 0] * torch.cos(pts_cyl[:, 1]),
+                        pts_cyl[:, 0] * torch.sin(pts_cyl[:, 1]),
+                        pts_cyl[:, 2],
+                    ],
+                    dim=-1,
+                )
+                .cpu()
+                .numpy()
+            )
 
             for p in pts:
                 visualizer.add_sphere(
@@ -307,13 +328,17 @@ class EETrackingCommand(CommandTerm):
     def _eval_batched(
         self, t_per_env: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Evaluate the quintic position spline at multiple times per env.
+        """Evaluate the quintic spline at multiple times per env.
+
+        The spline lives in cylindrical (r, θ, z) coords; this method
+        converts back to cartesian (x, y, z) with the proper chain rule
+        for the velocity.
 
         Args:
             t_per_env: shape (N, L). Times to evaluate per env.
 
         Returns:
-            (pos, vel) each of shape (N, L, 3).
+            (pos, vel) each of shape (N, L, 3), in world-frame xyz.
         """
         N, L = t_per_env.shape
         t_clamped = t_per_env.clamp(0.0, self.total_duration)
@@ -325,16 +350,33 @@ class EETrackingCommand(CommandTerm):
         local_t = t_clamped - self._cum_times[seg_idx]  # (N, L)
 
         env_grid = torch.arange(N, device=self.device).unsqueeze(-1).expand(N, L)
-        selected = self._coeffs[env_grid, seg_idx]  # (N, L, 6, 3)
+        selected = self._coeffs[env_grid, seg_idx]  # (N, L, 6, 3) in (r,θ,z)
 
         powers = torch.stack([local_t**i for i in range(6)], dim=-1)  # (N, L, 6)
-        pos = torch.einsum("nli,nlij->nlj", powers, selected)
+        pos_cyl = torch.einsum("nli,nlij->nlj", powers, selected)
 
         vel_coeffs = torch.stack(
             [(i + 1) * selected[..., i + 1, :] for i in range(5)], dim=-2
         )  # (N, L, 5, 3)
-        vel = torch.einsum("nli,nlij->nlj", powers[..., :5], vel_coeffs)
+        vel_cyl = torch.einsum("nli,nlij->nlj", powers[..., :5], vel_coeffs)
 
+        # Cylindrical → cartesian:
+        #   x = r cos θ        x_dot = r_dot cos θ − r θ_dot sin θ
+        #   y = r sin θ        y_dot = r_dot sin θ + r θ_dot cos θ
+        #   z = z              z_dot = z_dot
+        r = pos_cyl[..., 0]
+        th = pos_cyl[..., 1]
+        z = pos_cyl[..., 2]
+        rd = vel_cyl[..., 0]
+        thd = vel_cyl[..., 1]
+        zd = vel_cyl[..., 2]
+        cos_th = torch.cos(th)
+        sin_th = torch.sin(th)
+        pos = torch.stack([r * cos_th, r * sin_th, z], dim=-1)
+        vel = torch.stack(
+            [rd * cos_th - r * thd * sin_th, rd * sin_th + r * thd * cos_th, zd],
+            dim=-1,
+        )
         return pos, vel
 
 
@@ -364,6 +406,12 @@ class EETrackingCommandCfg(CommandTermCfg):
     """If True, the first waypoint of every sampled trajectory is the current
     EE pose (pos + quat), so the trajectory starts with zero initial error."""
 
+    r_min: float = 0.20
+    """Minimum cylindrical radius (m) of waypoints from the robot base z-axis.
+    Waypoints sampled with r < r_min are projected radially outward to r_min.
+    Used by the cylindrical quintic spline to avoid trajectories that would
+    cut through the base when waypoints lie on opposite sides of it."""
+
     radius_start: float = 0.05
     """Initial half-edge (m) of the cube around the current EE position from
     which subsequent waypoints are sampled. Trajectories then get clamped to
@@ -390,6 +438,16 @@ class EETrackingCommandCfg(CommandTermCfg):
     """Final through-velocity scale. Recommend ramping to ~0.6-0.8 over
     the curriculum so the policy is exposed to non-zero waypoint
     velocities late in training."""
+
+    alpha_min_ratio: float = 0.0
+    """Lower bound, as a fraction of the current ``vel_scale``, of the
+    per-trajectory through-speed coefficient ``alpha``. With the default
+    ``alpha_min_ratio=0.0``, alpha is sampled in ``U(0, vel_scale)`` — the
+    original behaviour, which includes near-rest trajectories stochastically.
+    Setting e.g. ``alpha_min_ratio=0.5`` restricts the sampling to
+    ``U(0.5 * vel_scale, vel_scale)``, biasing trajectories toward
+    consistently non-zero through-speeds (useful for fine-tunes that target
+    waypoint-to-waypoint motion continuity)."""
 
     curriculum_steps: int = 2_000_000
     """Number of env-steps over which radius linearly ramps from start to end."""

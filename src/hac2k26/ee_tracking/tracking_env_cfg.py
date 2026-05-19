@@ -184,7 +184,7 @@ def make_ee_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
         ),
         "tracking_pos_l2": RewardTermCfg(
             func=mdp.rewards.pos_error_l2_penalty,
-            weight=-1.5,
+            weight=-10.0,
             params={"asset_cfg": _HAND},
         ),
         "tracking_vel": RewardTermCfg(
@@ -217,21 +217,27 @@ def make_ee_tracking_env_cfg() -> ManagerBasedRlEnvCfg:
 
     commands = {
         "trajectory": mdp.commands.EETrackingCommandCfg(
-            num_waypoints=5,
-            segment_duration=1.5,
+            num_waypoints=6,
+            segment_duration=1.2,
             debug_vis=True,
-            workspace_low=(-0.30, -0.30, 0.25),
-            workspace_high=(0.55, 0.30, 0.55),
+            workspace_low=(-0.50, -0.40, 0.25),  # ~ 0.75 radius from the origin
+            workspace_high=(
+                0.45,
+                0.40,
+                0.50,
+            ),  # sqrt(0.45^2 + 0.4^2 + 0.5^2) ~ 0.65 radius from the origin
             lookahead_steps=5,
             lookahead_dt=0.05,
             anchor_first_waypoint=True,
             radius_start=0.15,
             radius_end=0.65,
+            r_min=0.25,
             ori_radius_start=0.20,
             ori_radius_end=0.80,
             vel_scale_start=0.0,
-            vel_scale_end=0.8,
-            curriculum_steps=100_000,
+            vel_scale_end=1.2,
+            alpha_min_ratio=0.0,
+            curriculum_steps=80_000,
             asset_name="robot",
             body_name="hand",
         ),

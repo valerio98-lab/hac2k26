@@ -59,12 +59,12 @@ HOME_KEYFRAME = EntityCfg.InitialStateCfg(
     pos=(0.0, 0.0, 0.0),
     joint_pos={
         "joint1": 0.0,
-        "joint2": 0.0,
+        "joint2": -0.7854,
         "joint3": 0.0,
-        "joint4": -1.57079,
+        "joint4": -2.3562,
         "joint5": 0.0,
         "joint6": 1.57079,
-        "joint7": -0.7853,
+        "joint7": 0.7853,
     },
     joint_vel={".*": 0.0},
 )
