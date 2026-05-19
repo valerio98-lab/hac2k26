@@ -101,20 +101,6 @@ def _build_eval_env(
     return env
 
 
-def _load_policy(env, task_id: str, checkpoint: Path, device: str):
-    agent_cfg = load_rl_cfg(task_id)
-    runner_cls = load_runner_cls(task_id) or MjlabOnPolicyRunner
-    wrapped = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
-    runner = runner_cls(wrapped, asdict(agent_cfg), device=device)
-    runner.load(
-        str(checkpoint),
-        load_cfg={"actor": True},
-        strict=True,
-        map_location=device,
-    )
-    return wrapped, runner.get_inference_policy(device=device)
-
-
 def _rollout(env, policy, n_steps: int, body_id: int) -> dict[str, np.ndarray]:
     """Step the env for ``n_steps`` collecting reference + actual EE state."""
     asset = env.unwrapped.scene["robot"]
@@ -333,7 +319,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             "for reproducible metrics"
         ),
     )
-    # OSC tuning.
     p.add_argument("--osc-kp-pos", type=float, default=12.0)
     p.add_argument("--osc-kp-ori", type=float, default=4.0)
     p.add_argument("--osc-damping", type=float, default=0.05)

@@ -59,13 +59,6 @@ class DeterministicEETrackingCommand(CommandTerm):
         return self._command
 
     def _resample_command(self, env_ids: torch.Tensor) -> None:
-        """Reset the per-env time counter. The trajectory anchor is set
-        lazily on the first ``_update_command`` call: ``_resample_command``
-        runs inside ``_reset_idx`` *before* the framework's ``sim.forward()``
-        pass, so ``body_link_pos_w`` here still reflects pre-reset xpos
-        (typically the all-zeros FK, ~0.9 m high) — not the freshly-written
-        home pose. By the time ``_update_command`` first fires inside
-        ``step()``, ``sim.forward()`` has run and xpos is current."""
         if env_ids.numel() == 0:
             return
         self._step_count[env_ids] = 0
@@ -116,8 +109,6 @@ class DeterministicEETrackingCommand(CommandTerm):
 
         path_color = (0.10, 0.55, 0.95, 0.60)  # cyan-ish, semi-transparent
         seg_radius = 0.004
-        # Draw every other segment to keep the primitive count low if the
-        # user asked for many samples; otherwise one cylinder per segment.
         stride = 1 if self._ghost_n <= 160 else 2
         for i in range(0, pts.shape[0] - 1, stride):
             visualizer.add_cylinder(
@@ -127,7 +118,6 @@ class DeterministicEETrackingCommand(CommandTerm):
                 color=path_color,
             )
 
-        # Anchor (path start) marker.
         visualizer.add_sphere(
             center=pts[0],
             radius=0.012,

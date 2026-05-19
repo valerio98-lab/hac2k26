@@ -125,8 +125,7 @@ def build_rest_to_rest_spline(
 
     Args:
         waypoints: shape (K, D), K >= 2. K-1 segments will be built.
-        segment_durations: per-segment duration. Python scalar or 1-D tensor of
-            length K-1.
+        segment_durations: per-segment duration.
     """
     if waypoints.dim() != 2 or waypoints.shape[0] < 2:
         raise ValueError(f"waypoints must be (K, D) with K>=2, got {waypoints.shape}")

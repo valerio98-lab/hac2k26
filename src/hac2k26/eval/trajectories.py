@@ -1,15 +1,3 @@
-"""Deterministic reference trajectories for evaluation.
-
-Both shapes are parameterised on a phase ``s(t)`` that follows a quintic
-rest-to-rest smoothstep over ``[0, T_total]``. This matches the time
-profile the policy was trained on (every waypoint segment is quintic
-rest-to-rest), so the evaluation isolates *shape tracking* from any
-artefact caused by a velocity discontinuity at t = 0.
-
-Each trajectory exposes ``evaluate(t)`` returning ``(p, v, q, omega)``
-in the world frame, batched over ``t``.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
