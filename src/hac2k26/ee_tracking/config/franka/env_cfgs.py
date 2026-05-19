@@ -14,12 +14,6 @@ def _apply_franka_overrides(
 
 
 def franka_ee_tracking_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
-    """Franka EE tracking with global cylindrical waypoint sampling."""
-    cfg = make_ee_tracking_env_cfg(sampling_mode="global")
-    return _apply_franka_overrides(cfg, play)
-
-
-def franka_ee_tracking_local_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
-    """Franka EE tracking with local cartesian waypoint sampling."""
-    cfg = make_ee_tracking_env_cfg(sampling_mode="local")
+    """Franka EE tracking with random quintic-spline waypoint trajectories."""
+    cfg = make_ee_tracking_env_cfg()
     return _apply_franka_overrides(cfg, play)

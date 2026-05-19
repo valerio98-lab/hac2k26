@@ -282,9 +282,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     p.add_argument(
         "--task",
         default=DEFAULT_TASK_ID,
-        choices=["Hac2k26-EETracking-Franka", "Hac2k26-EETracking-Franka-Local"],
-        help="Which registered task to load. Global = cylindrical sampling, "
-        "Local = cartesian sampling around current EE.",
+        help="Which registered task to load.",
     )
     p.add_argument(
         "--controller",

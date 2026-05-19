@@ -1,31 +1,16 @@
 """Trajectory command for EE tracking.
 
-Supports two waypoint-sampling regimes selected via ``sampling_mode``:
-
-- ``"local"`` — **Cartesian** quintic interpolation between waypoints sampled
-  in a ``±radius`` cube around the CURRENT EE position, clamped to a
-  workspace box ``[workspace_low, workspace_high]``. Produces local, smooth
-  motions; well-suited to small circles and figure-8s near the EE.
-
-- ``"global"`` — **Cylindrical** ``(r, θ, z)`` quintic interpolation between
-  waypoints sampled globally with ``r ∈ [r_min, r_max]``, ``θ`` accumulated
-  from the current EE angle via bounded Δθ increments, ``z ∈ [z_min, z_max]``.
-  Cartesian ``(x, y, z)`` reconstruction at eval time via
-  ``(r·cosθ, r·sinθ, z)`` guarantees paths with ``r ≥ r_min`` never cut
-  through the base. Produces large angular sweeps; well-suited to circles
-  centered on the base axis.
-
-Orientation is identical in both modes: SLERP between random quaternion
-waypoints with a quintic smoothstep time-reparametrization (so angular
-velocity is zero at every waypoint, matching the position rest-to-rest
-behaviour).
+Generates a piecewise reference signal for the end-effector through K random
+waypoints in a configurable workspace box. Position uses rest-to-rest quintic
+splines; orientation uses SLERP between random quaternion waypoints with the
+same quintic smoothstep time-reparametrization (so angular velocity is zero at
+every waypoint, matching the position rest-to-rest behaviour).
 
 Internally state is fully batched over envs:
-    coeffs:      (num_envs, K-1, 6, 3) — quintic coefficients per segment,
-                                         channels (x, y, z) in ``local`` mode
-                                         or (r, θ, z) in ``global`` mode
+    coeffs:      (num_envs, K-1, 6, 3) — quintic coefficients per segment
     q_start:     (num_envs, K-1, 4)    — start quaternion of each segment (wxyz)
-    axis_angle:  (num_envs, K-1, 3)    — world-frame log(q_{i+1} q_i^{-1})
+    axis_angle:  (num_envs, K-1, 3)    — world-frame log(q_{i+1} q_i^{-1}),
+                                         i.e. axis-angle of the relative rotation
     cum_times:   (K,)                  — shared since segment_duration is uniform
 
 Resampling is auto-triggered by the command manager when ``time_left`` hits
@@ -36,7 +21,7 @@ so a new trajectory is sampled exactly when the previous one completes.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
 import torch
 from mjlab.managers.command_manager import CommandTerm, CommandTermCfg
@@ -47,12 +32,12 @@ from mjlab.utils.lab_api.math import (
 
 if TYPE_CHECKING:
     from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
+    from mjlab.viewer.debug_visualizer import DebugVisualizer
 
 
 class EETrackingCommand(CommandTerm):
     """Quintic-spline EE reference generator with phase, lookahead and SLERP
-    orientation. Supports ``local`` (cartesian) and ``global`` (cylindrical)
-    waypoint-sampling modes.
+    orientation.
 
     Command tensor layout (column ranges):
         [0:3]                          p_ref      — target EE position (m)
@@ -68,12 +53,6 @@ class EETrackingCommand(CommandTerm):
     def __init__(self, cfg: EETrackingCommandCfg, env: ManagerBasedRlEnv):
         super().__init__(cfg, env)
 
-        if cfg.sampling_mode not in ("local", "global"):
-            raise ValueError(
-                f"sampling_mode must be 'local' or 'global', got {cfg.sampling_mode!r}"
-            )
-        self._mode = cfg.sampling_mode
-
         self.K = int(cfg.num_waypoints)
         if self.K < 2:
             raise ValueError(f"num_waypoints must be >= 2, got {self.K}")
@@ -83,33 +62,12 @@ class EETrackingCommand(CommandTerm):
         self.L = int(cfg.lookahead_steps)
         self.lookahead_dt = float(cfg.lookahead_dt)
 
-        self._anchor = bool(cfg.anchor_first_waypoint)
-
-        # Local-mode params.
         self._ws_low = torch.tensor(cfg.workspace_low, device=self.device)
         self._ws_high = torch.tensor(cfg.workspace_high, device=self.device)
+
+        self._anchor = bool(cfg.anchor_first_waypoint)
         self._radius_start = float(cfg.radius_start)
         self._radius_end = float(cfg.radius_end)
-
-        # Global-mode params.
-        self._r_min = float(cfg.r_min)
-        self._r_max = float(cfg.r_max)
-        self._z_min = float(cfg.z_min)
-        self._z_max = float(cfg.z_max)
-        self._dtheta_max_start = float(cfg.dtheta_max_start)
-        self._dtheta_max_end = float(cfg.dtheta_max_end)
-        # Absolute clamp on the cumulative (unwrapped) theta. The EE polar
-        # angle around the base z-axis must be reachable by joint1, whose
-        # soft limit on the Panda is ±0.9 · 2.8973 ≈ ±2.608 rad. Trajectories
-        # whose unwrapped theta would exceed this are geometrically
-        # infeasible no matter how the redundancy is resolved.
-        self._theta_max = float(cfg.theta_max_rad)
-        if self._theta_max <= 0.0:
-            raise ValueError(
-                f"theta_max_rad must be > 0, got {self._theta_max}"
-            )
-
-        # Shared.
         self._ori_radius_start = float(cfg.ori_radius_start)
         self._ori_radius_end = float(cfg.ori_radius_end)
         self._vel_scale_start = float(cfg.vel_scale_start)
@@ -132,27 +90,58 @@ class EETrackingCommand(CommandTerm):
         cmd_dim = 3 + 3 + 1 + 4 + 3 + 3 * self.L
         self._command = torch.zeros(self.num_envs, cmd_dim, device=self.device)
 
+        # Reset-time deferral state. ``_resample_command`` called from
+        # ``command_manager.reset()`` (inside ``_reset_idx``) sees STALE
+        # ``body_link_pos_w`` because the framework's ``sim.forward()`` has
+        # not yet propagated the freshly-written home qpos to xpos. We
+        # mark these envs as ``anchor_dirty`` and re-sample them on the
+        # next ``_update_command`` call, where xpos is current.
+        self._anchor_dirty = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self._in_reset = False
+
     @property
     def command(self) -> torch.Tensor:
         return self._command
 
-    def _curriculum_progress(self) -> float:
-        return min(1.0, float(self._env.common_step_counter) / self._curriculum_steps)
+    def reset(self, env_ids: torch.Tensor | None = None):
+        """Wraps the base reset so ``_resample_command`` invocations triggered
+        from ``_reset_idx`` (where xpos is stale) get deferred to the next
+        ``_update_command``. Mid-episode resamples (called from ``compute()``
+        when ``time_left`` hits zero) go through the same ``_resample_command``
+        path but with the flag cleared, so they use the fresh xpos directly."""
+        self._in_reset = True
+        try:
+            info = super().reset(env_ids)
+        finally:
+            self._in_reset = False
+        return info
 
     def _resample_command(self, env_ids: torch.Tensor) -> None:
+        """Dispatcher: defer at reset (stale xpos), otherwise do the work."""
         n = int(env_ids.numel())
         if n == 0:
             return
-        if self._mode == "local":
-            self._resample_local_cartesian(env_ids, n)
-        else:
-            self._resample_global_cylindrical(env_ids, n)
+        if self._in_reset:
+            self._anchor_dirty[env_ids] = True
+            return
+        self._do_resample(env_ids)
 
-    def _resample_local_cartesian(self, env_ids: torch.Tensor, n: int) -> None:
-        """Sample K waypoints in a ±radius cube around the current EE,
-        clamped to ``[workspace_low, workspace_high]``. Quintic interpolation
-        is done in cartesian (x, y, z) channels."""
-        progress = self._curriculum_progress()
+    def _do_resample(self, env_ids: torch.Tensor) -> None:
+        """Sample K waypoints (position + orientation) and precompute
+        per-segment trajectory state for the given envs.
+
+        Curriculum: waypoints[1:] are sampled in a ±r cube around the current
+        EE position (clamped to workspace), where r linearly ramps from
+        ``radius_start`` to ``radius_end`` over ``curriculum_steps`` env-steps.
+        If ``anchor_first_waypoint`` is True, waypoints[0] is the current EE
+        pose (so the trajectory starts with zero initial error)."""
+        n = int(env_ids.numel())
+
+        progress = min(
+            1.0, float(self._env.common_step_counter) / self._curriculum_steps
+        )
         radius = self._radius_start + progress * (self._radius_end - self._radius_start)
         ori_radius = self._ori_radius_start + progress * (
             self._ori_radius_end - self._ori_radius_start
@@ -173,95 +162,10 @@ class EETrackingCommand(CommandTerm):
             wps = wps.clone()
             wps[:, 0, :] = ee_pos
 
-        self._fit_quintic_and_store(env_ids, wps, vel_scale, n)
-        self._sample_orientation_and_store(env_ids, ee_quat, ori_radius, n)
-
-    def _resample_global_cylindrical(self, env_ids: torch.Tensor, n: int) -> None:
-        """Sample K cylindrical waypoints. θ is kept UNWRAPPED (cumulative sum of
-        bounded Δθ increments from the EE angle), so the per-segment quintic
-        interpolates the short angular path between two waypoints — never
-        going the long way around via the modulo-2π gap."""
-        progress = self._curriculum_progress()
-        dtheta_max = self._dtheta_max_start + progress * (
-            self._dtheta_max_end - self._dtheta_max_start
-        )
-        ori_radius = self._ori_radius_start + progress * (
-            self._ori_radius_end - self._ori_radius_start
-        )
-        vel_scale = self._vel_scale_start + progress * (
-            self._vel_scale_end - self._vel_scale_start
-        )
-
-        asset = self._env.scene[self._asset_name]
-        ee_pos = asset.data.body_link_pos_w[env_ids, self._body_id, :]  # (n, 3)
-        ee_quat = asset.data.body_link_quat_w[env_ids, self._body_id, :]  # (n, 4)
-
-        curr_theta = torch.atan2(ee_pos[:, 1], ee_pos[:, 0]).unsqueeze(-1)  # (n, 1)
-
-        # 50/50 mix of per-trajectory sampling regimes:
-        #  - "biased": one shared sign per trajectory and per-segment magnitudes
-        #    in [0, dtheta_max] — produces consistently CCW or CW rotation
-        #    (50/50 between the two), which is the regime needed for clean
-        #    circular eval trajectories.
-        #  - "wobble": per-segment Δθ in [-dtheta_max, +dtheta_max] — a random
-        #    walk in θ that produces direction reversals, useful for figure-8
-        #    and moving-target style references.
-        sign = torch.where(
-            torch.rand(n, 1, device=self.device) < 0.5,
-            -torch.ones(n, 1, device=self.device),
-            torch.ones(n, 1, device=self.device),
-        )
-        biased = sign * dtheta_max * torch.rand(n, self.K - 1, device=self.device)
-        wobble = (
-            2.0 * torch.rand(n, self.K - 1, device=self.device) - 1.0
-        ) * dtheta_max
-        use_biased = torch.rand(n, 1, device=self.device) < 0.5
-        delta_theta = torch.where(use_biased, biased, wobble)
-
-        # Cumulative unwrapped theta. The first column equals curr_theta
-        # by construction (anchor). Subsequent columns are clamped to
-        # ±theta_max so the trajectory stays inside joint1's soft limit;
-        # if the cumulative sweep saturates, the spline still moves in r
-        # and z but stops rotating around the base — that is the correct
-        # graceful-degradation behaviour at the joint limit. The anchor
-        # column is left untouched even if curr_theta would otherwise be
-        # out of range (rare; preserves the start-at-EE invariant).
-        cumsum_delta = torch.cumsum(delta_theta, dim=-1)  # (n, K-1)
-        theta_tail = (curr_theta + cumsum_delta).clamp(
-            -self._theta_max, self._theta_max
-        )  # (n, K-1)
-        theta_i = torch.cat([curr_theta, theta_tail], dim=-1)  # (n, K)
-        r_i = self._r_min + (self._r_max - self._r_min) * torch.rand(
-            n, self.K, device=self.device
-        )
-        z_i = self._z_min + (self._z_max - self._z_min) * torch.rand(
-            n, self.K, device=self.device
-        )
-
-        if self._anchor:
-            r_curr = ee_pos[:, :2].norm(dim=-1)
-            r_i = r_i.clone()
-            z_i = z_i.clone()
-            r_i[:, 0] = r_curr
-            z_i[:, 0] = ee_pos[:, 2]
-            # theta_i[:, 0] is already curr_theta by construction.
-
-        wps_cyl = torch.stack([r_i, theta_i, z_i], dim=-1)  # (n, K, 3)
-
-        self._fit_quintic_and_store(env_ids, wps_cyl, vel_scale, n)
-        self._sample_orientation_and_store(env_ids, ee_quat, ori_radius, n)
-
-    def _fit_quintic_and_store(
-        self,
-        env_ids: torch.Tensor,
-        wps: torch.Tensor,
-        vel_scale: float,
-        n: int,
-    ) -> None:
-        """Fit quintic Hermite per-segment in whatever channel space ``wps``
-        lives in (cartesian for local mode, cylindrical for global mode).
-        Centripetal Catmull-Rom velocities at INTERIOR waypoints; v=0 at the
-        two endpoints so trajectories start and end at rest."""
+        # Centripetal Catmull-Rom velocities for INTERIOR waypoints; v=0 at
+        # the two endpoints so trajectories always start and end at rest.
+        # alpha is sampled per trajectory (one shared scale per env), so the
+        # whole trajectory uses a consistent through-speed.
         T = self.T_seg
         T2 = T * T
         T3 = T2 * T
@@ -270,9 +174,12 @@ class EETrackingCommand(CommandTerm):
 
         wp_vels = torch.zeros_like(wps)  # (n, K, 3), endpoints stay 0
         if self.K >= 3 and vel_scale > 0.0:
+            # alpha ~ U(0, vel_scale) per env.
             alpha = vel_scale * torch.rand(n, 1, 1, device=self.device)
+            # Interior tangent v_i = alpha * (p_{i+1} - p_{i-1}) / (2 T)
             wp_vels[:, 1:-1, :] = alpha * ((wps[:, 2:, :] - wps[:, :-2, :]) / (2.0 * T))
 
+        # Quintic with BCs (p_i, v_i, a=0) -> (p_{i+1}, v_{i+1}, a=0).
         p_i = wps[:, :-1, :]
         p_ip1 = wps[:, 1:, :]
         v_i = wp_vels[:, :-1, :]
@@ -291,13 +198,6 @@ class EETrackingCommand(CommandTerm):
         coeffs = torch.stack([c0, c1, c2, c3, c4, c5], dim=2)  # (n, K-1, 6, 3)
         self._coeffs[env_ids] = coeffs
 
-    def _sample_orientation_and_store(
-        self,
-        env_ids: torch.Tensor,
-        ee_quat: torch.Tensor,
-        ori_radius: float,
-        n: int,
-    ) -> None:
         rand_dir = torch.randn(n, self.K, 3, device=self.device)
         rand_dir = rand_dir / (rand_dir.norm(dim=-1, keepdim=True) + 1e-8)
         rand_mag = ori_radius * torch.rand(n, self.K, 1, device=self.device)
@@ -317,6 +217,15 @@ class EETrackingCommand(CommandTerm):
 
     def _update_command(self) -> None:
         """Evaluate the reference signal at the current trajectory time."""
+        # Late-bind any anchors that were deferred at reset time. xpos has now
+        # been refreshed by the framework's ``sim.forward()`` (called between
+        # ``_reset_idx`` and ``command_manager.compute()`` in ``step()``), so
+        # ``body_link_pos_w`` here reflects the home pose.
+        if self._anchor_dirty.any():
+            dirty_ids = self._anchor_dirty.nonzero(as_tuple=False).squeeze(-1)
+            self._do_resample(dirty_ids)
+            self._anchor_dirty[dirty_ids] = False
+
         t_now = (self.total_duration - self.time_left).clamp(0.0, self.total_duration)
 
         phase = (t_now / self.total_duration).unsqueeze(-1)  # (N, 1)
@@ -353,16 +262,29 @@ class EETrackingCommand(CommandTerm):
         pass
 
     def _debug_vis_impl(self, visualizer) -> None:
-        N_samples = 300
-        t = torch.linspace(
-            0.0, self.total_duration, N_samples, device=self.device
-        )  # (N,)
-
-        t_batched = t.unsqueeze(0).expand(self.num_envs, -1)  # (num_envs, N)
-        pts_all, _ = self._eval_batched(t_batched)  # (num_envs, N, 3) cartesian
 
         for env_idx in visualizer.get_env_indices(self.num_envs):
-            pts = pts_all[env_idx].cpu().numpy()
+            N_samples = 300
+            t = torch.linspace(
+                0.0, self.total_duration, N_samples, device=self.device
+            ).unsqueeze(
+                0
+            )  # (1, N)
+            # Temporarily evaluate just this env.
+            coeffs = self._coeffs[env_idx : env_idx + 1]
+            cum = self._cum_times
+            interior = cum[1:-1]
+            seg = torch.searchsorted(
+                interior, t.clamp(0.0, self.total_duration), right=True
+            )
+            seg = seg.clamp(0, self.n_seg - 1)
+            local_t = t - cum[seg]
+            powers = torch.stack([local_t**i for i in range(6)], dim=-1)  # (1, N, 6)
+            selected = coeffs[0, seg[0]]  # (N, 6, 3)
+            pts = (
+                torch.einsum("ni,nij->nj", powers[0], selected).cpu().numpy()
+            )  # (N, 3)
+
             for p in pts:
                 visualizer.add_sphere(
                     center=p, radius=0.008, color=(0.2, 0.9, 0.3, 0.8)
@@ -385,16 +307,13 @@ class EETrackingCommand(CommandTerm):
     def _eval_batched(
         self, t_per_env: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Evaluate the quintic at multiple times per env and return the
-        **cartesian** position and velocity. In ``global`` mode the polynomial
-        channels are (r, θ, z) and are converted to cartesian via cos/sin
-        plus the velocity chain rule.
+        """Evaluate the quintic position spline at multiple times per env.
 
         Args:
             t_per_env: shape (N, L). Times to evaluate per env.
 
         Returns:
-            (pos, vel) each of shape (N, L, 3) in world cartesian frame.
+            (pos, vel) each of shape (N, L, 3).
         """
         N, L = t_per_env.shape
         t_clamped = t_per_env.clamp(0.0, self.total_duration)
@@ -409,35 +328,12 @@ class EETrackingCommand(CommandTerm):
         selected = self._coeffs[env_grid, seg_idx]  # (N, L, 6, 3)
 
         powers = torch.stack([local_t**i for i in range(6)], dim=-1)  # (N, L, 6)
-        channels = torch.einsum("nli,nlij->nlj", powers, selected)  # (N, L, 3)
+        pos = torch.einsum("nli,nlij->nlj", powers, selected)
 
         vel_coeffs = torch.stack(
             [(i + 1) * selected[..., i + 1, :] for i in range(5)], dim=-2
         )  # (N, L, 5, 3)
-        channels_vel = torch.einsum("nli,nlij->nlj", powers[..., :5], vel_coeffs)
-
-        if self._mode == "local":
-            # Channels are already (x, y, z).
-            return channels, channels_vel
-
-        # Global mode: channels are (r, θ, z). Convert to cartesian.
-        r = channels[..., 0]
-        th = channels[..., 1]
-        z = channels[..., 2]
-        cos_th = torch.cos(th)
-        sin_th = torch.sin(th)
-        pos = torch.stack([r * cos_th, r * sin_th, z], dim=-1)
-
-        # Chain-rule for velocity:
-        #   dx/dt = dr/dt cosθ - r sinθ dθ/dt
-        #   dy/dt = dr/dt sinθ + r cosθ dθ/dt
-        #   dz/dt = dz/dt
-        dr = channels_vel[..., 0]
-        dth = channels_vel[..., 1]
-        dz = channels_vel[..., 2]
-        vx = dr * cos_th - r * sin_th * dth
-        vy = dr * sin_th + r * cos_th * dth
-        vel = torch.stack([vx, vy, dz], dim=-1)
+        vel = torch.einsum("nli,nlij->nlj", powers[..., :5], vel_coeffs)
 
         return pos, vel
 
@@ -446,26 +342,17 @@ class EETrackingCommand(CommandTerm):
 class EETrackingCommandCfg(CommandTermCfg):
     """Configuration for `EETrackingCommand`."""
 
-    sampling_mode: Literal["local", "global"] = "global"
-    """Waypoint sampling regime.
-
-    - ``"local"``  — cartesian quintic, waypoints in a ``±radius`` cube around
-                     the current EE, clamped to ``[workspace_low, workspace_high]``.
-    - ``"global"`` — cylindrical quintic, waypoints sampled globally with
-                     ``r ∈ [r_min, r_max]``, θ accumulated by bounded Δθ from
-                     the current EE angle, ``z ∈ [z_min, z_max]``."""
-
     num_waypoints: int = 5
     """Number of random waypoints per trajectory (K). K-1 segments."""
 
     segment_duration: float = 1.5
     """Duration of each segment in seconds. Total trajectory: (K-1) * segment_duration."""
 
-    workspace_low: tuple[float, float, float] = (0.20, -0.40, 0.10)
-    """Lower corner of the cartesian clamping box. **Local mode only.**"""
+    workspace_low: tuple[float, float, float] = (0.30, -0.30, 0.20)
+    """Lower corner of the random-waypoint sampling box (m, world frame)."""
 
-    workspace_high: tuple[float, float, float] = (0.70, 0.40, 0.80)
-    """Upper corner of the cartesian clamping box. **Local mode only.**"""
+    workspace_high: tuple[float, float, float] = (0.60, 0.30, 0.60)
+    """Upper corner of the random-waypoint sampling box (m, world frame)."""
 
     lookahead_steps: int = 5
     """Number of future reference samples exposed to the policy."""
@@ -477,65 +364,35 @@ class EETrackingCommandCfg(CommandTermCfg):
     """If True, the first waypoint of every sampled trajectory is the current
     EE pose (pos + quat), so the trajectory starts with zero initial error."""
 
-    # ----- Local-mode params ---------------------------------------------------
-
-    radius_start: float = 0.15
+    radius_start: float = 0.05
     """Initial half-edge (m) of the cube around the current EE position from
-    which subsequent waypoints are sampled. **Local mode only.**"""
+    which subsequent waypoints are sampled. Trajectories then get clamped to
+    [workspace_low, workspace_high]."""
 
-    radius_end: float = 0.45
-    """Final half-edge (m) of the sampling cube after curriculum ramp-up.
-    **Local mode only.**"""
-
-    # ----- Global-mode params --------------------------------------------------
-
-    r_min: float = 0.35
-    """Inner radial bound (m, world XY plane from base) for waypoint sampling.
-    **Global mode only.**"""
-
-    r_max: float = 0.75
-    """Outer radial bound (m). Should respect the arm's reachable XY radius.
-    **Global mode only.**"""
-
-    z_min: float = 0.10
-    """Lower z bound (m). **Global mode only.**"""
-
-    z_max: float = 0.90
-    """Upper z bound (m). **Global mode only.**"""
-
-    dtheta_max_start: float = 0.5
-    """Initial maximum per-segment angular increment Δθ_max (rad).
-    **Global mode only.**"""
-
-    dtheta_max_end: float = 2.0
-    """Final Δθ_max (rad). **Global mode only.**"""
-
-    theta_max_rad: float = 2.5
-    """Absolute clamp on the cumulative (unwrapped) waypoint theta around
-    the base z-axis. Default 2.5 rad sits inside the Panda joint1 soft
-    limit of 0.9 · 2.8973 ≈ 2.608 rad. Trajectories whose unwrapped theta
-    would exceed this are not reachable by joint1, so the cumulative sum
-    is clamped before spline fitting. **Global mode only.**"""
-
-    # ----- Shared --------------------------------------------------------------
+    radius_end: float = 0.30
+    """Final half-edge (m) of the sampling cube after curriculum ramp-up."""
 
     ori_radius_start: float = 0.15
     """Initial max angular perturbation (rad) of waypoint quaternions around
     the current EE orientation."""
 
     ori_radius_end: float = 0.80
-    """Final max angular perturbation (rad) after curriculum ramp-up."""
+    """Final max angular perturbation (rad) after curriculum ramp-up
+    (~45 deg). Kept moderate so targets stay reachable for the arm."""
 
     vel_scale_start: float = 0.0
     """Initial through-velocity scale. v_i at an interior waypoint is
     ``alpha * (p_{i+1} - p_{i-1}) / (2 T_seg)`` with alpha sampled in
-    [0, vel_scale]."""
+    [0, vel_scale]. ``vel_scale=0`` reduces to pure rest-to-rest
+    (matches the prior training-time behaviour)."""
 
     vel_scale_end: float = 0.0
-    """Final through-velocity scale."""
+    """Final through-velocity scale. Recommend ramping to ~0.6-0.8 over
+    the curriculum so the policy is exposed to non-zero waypoint
+    velocities late in training."""
 
     curriculum_steps: int = 2_000_000
-    """Number of env-steps over which curriculum params linearly ramp."""
+    """Number of env-steps over which radius linearly ramps from start to end."""
 
     asset_name: str = "robot"
     """Scene entity to query for the EE pose at resample time."""
