@@ -2,9 +2,7 @@
 
 Generates a piecewise reference signal for the end-effector through K random
 waypoints in a configurable workspace box. Position uses rest-to-rest quintic
-splines in CYLINDRICAL coordinates (r, θ, z) about the robot base z-axis —
-this way segments connecting waypoints on opposite sides of the base produce
-arcs around it rather than straight lines through it. Orientation uses SLERP
+splines in cylindrical coordinates (r, θ, z) about the robot base z-axis. Orientation uses SLERP
 between random quaternion waypoints with the same quintic smoothstep
 time-reparametrization (so angular velocity is zero at every waypoint,
 matching the position rest-to-rest behaviour).
@@ -16,8 +14,8 @@ Internally state is fully batched over envs:
                                          i.e. axis-angle of the relative rotation
     cum_times:   (K,)                  — shared since segment_duration is uniform
 
-Resampling is auto-triggered by the command manager when ``time_left`` hits
-zero. ``resampling_time_range`` is set to ``(total_duration, total_duration)``
+Resampling is auto-triggered by the command manager when 'time_left' hits
+zero. 'resampling_time_range' is set to ``(total_duration, total_duration)``
 so a new trajectory is sampled exactly when the previous one completes.
 """
 
@@ -95,12 +93,6 @@ class EETrackingCommand(CommandTerm):
         cmd_dim = 3 + 3 + 1 + 4 + 3 + 3 * self.L
         self._command = torch.zeros(self.num_envs, cmd_dim, device=self.device)
 
-        # Reset-time deferral state. ``_resample_command`` called from
-        # ``command_manager.reset()`` (inside ``_reset_idx``) sees STALE
-        # ``body_link_pos_w`` because the framework's ``sim.forward()`` has
-        # not yet propagated the freshly-written home qpos to xpos. We
-        # mark these envs as ``anchor_dirty`` and re-sample them on the
-        # next ``_update_command`` call, where xpos is current.
         self._anchor_dirty = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device
         )
@@ -111,11 +103,6 @@ class EETrackingCommand(CommandTerm):
         return self._command
 
     def reset(self, env_ids: torch.Tensor | None = None):
-        """Wraps the base reset so ``_resample_command`` invocations triggered
-        from ``_reset_idx`` (where xpos is stale) get deferred to the next
-        ``_update_command``. Mid-episode resamples (called from ``compute()``
-        when ``time_left`` hits zero) go through the same ``_resample_command``
-        path but with the flag cleared, so they use the fresh xpos directly."""
         self._in_reset = True
         try:
             info = super().reset(env_ids)
@@ -124,7 +111,6 @@ class EETrackingCommand(CommandTerm):
         return info
 
     def _resample_command(self, env_ids: torch.Tensor) -> None:
-        """Dispatcher: defer at reset (stale xpos), otherwise do the work."""
         n = int(env_ids.numel())
         if n == 0:
             return
@@ -135,13 +121,7 @@ class EETrackingCommand(CommandTerm):
 
     def _do_resample(self, env_ids: torch.Tensor) -> None:
         """Sample K waypoints (position + orientation) and precompute
-        per-segment trajectory state for the given envs.
-
-        Curriculum: waypoints[1:] are sampled in a ±r cube around the current
-        EE position (clamped to workspace), where r linearly ramps from
-        ``radius_start`` to ``radius_end`` over ``curriculum_steps`` env-steps.
-        If ``anchor_first_waypoint`` is True, waypoints[0] is the current EE
-        pose (so the trajectory starts with zero initial error)."""
+        per-segment trajectory state for the given envs."""
         n = int(env_ids.numel())
 
         progress = min(
@@ -329,10 +309,8 @@ class EETrackingCommand(CommandTerm):
         self, t_per_env: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Evaluate the quintic spline at multiple times per env.
-
-        The spline lives in cylindrical (r, θ, z) coords; this method
-        converts back to cartesian (x, y, z) with the proper chain rule
-        for the velocity.
+        The spline lives in cylindrical (r, θ, z) coords this method
+        converts back to cartesian (x, y, z)
 
         Args:
             t_per_env: shape (N, L). Times to evaluate per env.
@@ -408,9 +386,7 @@ class EETrackingCommandCfg(CommandTermCfg):
 
     r_min: float = 0.20
     """Minimum cylindrical radius (m) of waypoints from the robot base z-axis.
-    Waypoints sampled with r < r_min are projected radially outward to r_min.
-    Used by the cylindrical quintic spline to avoid trajectories that would
-    cut through the base when waypoints lie on opposite sides of it."""
+    Waypoints sampled with r < r_min are projected radially outward to r_min."""
 
     radius_start: float = 0.05
     """Initial half-edge (m) of the cube around the current EE position from
@@ -431,32 +407,18 @@ class EETrackingCommandCfg(CommandTermCfg):
     vel_scale_start: float = 0.0
     """Initial through-velocity scale. v_i at an interior waypoint is
     ``alpha * (p_{i+1} - p_{i-1}) / (2 T_seg)`` with alpha sampled in
-    [0, vel_scale]. ``vel_scale=0`` reduces to pure rest-to-rest
-    (matches the prior training-time behaviour)."""
+    [0, vel_scale]. ``vel_scale=0`` reduces to pure rest-to-rest"""
 
     vel_scale_end: float = 0.0
-    """Final through-velocity scale. Recommend ramping to ~0.6-0.8 over
-    the curriculum so the policy is exposed to non-zero waypoint
-    velocities late in training."""
+    """Final through-velocity scale."""
 
     alpha_min_ratio: float = 0.0
-    """Lower bound, as a fraction of the current ``vel_scale``, of the
-    per-trajectory through-speed coefficient ``alpha``. With the default
-    ``alpha_min_ratio=0.0``, alpha is sampled in ``U(0, vel_scale)`` — the
-    original behaviour, which includes near-rest trajectories stochastically.
-    Setting e.g. ``alpha_min_ratio=0.5`` restricts the sampling to
-    ``U(0.5 * vel_scale, vel_scale)``, biasing trajectories toward
-    consistently non-zero through-speeds (useful for fine-tunes that target
-    waypoint-to-waypoint motion continuity)."""
 
     curriculum_steps: int = 2_000_000
     """Number of env-steps over which radius linearly ramps from start to end."""
 
     asset_name: str = "robot"
-    """Scene entity to query for the EE pose at resample time."""
-
     body_name: str = "hand"
-    """Body of ``asset_name`` whose world-frame pose anchors the trajectory."""
 
     resampling_time_range: tuple[float, float] = field(default=(0.0, 0.0))
     """Auto-set in __post_init__ to match trajectory total duration."""

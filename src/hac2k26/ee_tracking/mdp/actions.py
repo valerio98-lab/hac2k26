@@ -22,8 +22,7 @@ class DelayedRelativeJointPositionActionCfg(RelativeJointPositionActionCfg):
 
     A DelayBuffer holds the last ``max_lag + 1`` raw policy outputs per env
     and serves one delayed by a lag sampled uniformly in
-    ``[min_lag, max_lag]`` at each control step. Simulates the latency of a
-    real control stack (sim2real source of uncertainty).
+    ``[min_lag, max_lag]`` at each control step..
     """
 
     min_lag: int = 1

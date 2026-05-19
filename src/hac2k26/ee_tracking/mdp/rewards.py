@@ -78,7 +78,6 @@ def action_jerk_l2(env: ManagerBasedRlEnv) -> torch.Tensor:
 
     Penalises the second discrete derivative of the action sequence, which
     directly drives the high-frequency jitter visible at play time.
-    Complements ``action_rate_l2`` (which only penalises the first derivative).
     """
     a = env.action_manager.action
     a_prev = env.action_manager.prev_action

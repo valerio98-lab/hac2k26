@@ -114,13 +114,7 @@ def manipulability(
     joint_pattern: str = "joint[1-7]",
     eps: float = 1.0e-8,
 ) -> torch.Tensor:
-    """Linear-Jacobian manipulability ``w(q) = sqrt(det(J · J^T))``.
-
-    Shape ``(N, 1)``. Smooth, strictly non-negative, zero exactly at
-    singularities. Typical home-pose value for the Franka is ~0.05-0.10
-    (units: m^3 / rad^3) — used directly as an observation; downstream
-    obs normalisation rescales it.
-    """
+    """Linear-Jacobian manipulability 'w(q) = sqrt(det(J · J^T))'"""
     buf = _get_or_create_buffers(env, asset_cfg, joint_pattern)
     jacp = _compute_linear_jacobian(env, buf)  # (N, 3, 7)
     jjt = jacp @ jacp.transpose(-2, -1)  # (N, 3, 3)
@@ -134,14 +128,7 @@ def singularity_penalty(
     joint_pattern: str = "joint[1-7]",
     w_min: float = 0.04,
 ) -> torch.Tensor:
-    """One-sided hinge penalty on manipulability deficit.
 
-    Returns ``(N,)`` non-negative tensor. Apply with a **negative**
-    reward weight so the policy is pushed away from singular regions
-    *only* when ``w(q) < w_min``. The quadratic shape makes the gradient
-    small when barely violated and grow as the configuration gets
-    closer to a true singularity.
-    """
     w = manipulability(env, asset_cfg, joint_pattern).squeeze(-1)  # (N,)
     deficit = (w_min - w).clamp(min=0.0)
     return deficit * deficit
