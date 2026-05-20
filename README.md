@@ -208,16 +208,26 @@ The policy tracks *best* when the training-time delay is active, not when it is 
 ## Reproducing
 
 ```bash
-# Deterministic circle + figure-8
+# Visual eval of circle and figure8 trajectories
+uv run python scripts/eval_play.py \
+    --checkpoint logs/rsl_rl/franka_ee_tracking/<run>/model_<iter>.pt \
+    --trajectory circle --duration 12.0 --radius 0.2 --n_cycles 3
+
+uv run python scripts/eval_play.py \
+    --checkpoint logs/rsl_rl/franka_ee_tracking/<run>/model_<iter>.pt \
+    --trajectory figure8 --duration 25.0 --scale 0.3 --n_cycles 3
+
+# Training-distribution stats across 256 parallel envs (prints numerical summary)
+uv run python scripts/eval_random.py \
+    --checkpoint logs/rsl_rl/franka_ee_tracking/<run>/model_<iter>.pt \
+    --num-envs 256
+
+# Deterministic numerical evaluation on circle + figure-8 (writes CSV + PNG plots to --output-dir)
 uv run python -m hac2k26.eval.run \
     --checkpoint logs/rsl_rl/franka_ee_tracking/<run>/model_<iter>.pt \
     --output-dir eval_outputs/rl \
     --trajectories circle figure8 --disable-dr
 
-# Training-distribution stats across 256 parallel envs
-uv run python scripts/eval_random.py \
-    --checkpoint logs/rsl_rl/franka_ee_tracking/<run>/model_<iter>.pt \
-    --num-envs 256
 ```
 
 Add or remove `--disable-action-delay` and `--disable-dr` to reproduce the robustness ablation.
