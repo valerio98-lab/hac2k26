@@ -61,13 +61,13 @@ Training takes about three hours on a single RTX 4070.
 
 ## The problem
 
-Tracking 3D end-effector trajectories on a 7-DOF arm is something classical model-based / task-space controllers do well in clean simulation. Three things break that recipe and motivate using RL here:
+Classical model-based / task-space controllers solve trajectory tracking well in clean simulation. Three sources of uncertainty break that recipe:
 
-1. **Sensor noise** on joint positions and velocities corrupts the state used for IK.
-2. **Action delay** between the policy decision and the actuator response makes the controller chase a stale target.
-3. **Dynamics mismatch** (link masses, joint friction) shifts the actual response away from the nominal model used to design the controller.
+1. **Sensor noise** on joint pos/vel corrupts the state used for IK.
+2. **Action delay** makes the controller chase a stale target.
+3. **Dynamics mismatch** (link masses, joint friction) shifts the actual response from the nominal model.
 
-A fourth requirement, smoothness, is implicit but essential: a policy that tracks the target by jittering at 50 Hz is useless on real hardware. Each design choice below is a direct answer to one of these.
+A fourth, implicit requirement: **smoothness**. A jittery 50 Hz output is useless on hardware. Each design choice below answers one of these.
 
 ## Design choices
 
