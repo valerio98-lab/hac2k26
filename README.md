@@ -24,17 +24,58 @@ Training takes about three hours on a single RTX 4070.
 
 ## How it works
 
-**State.** The actor sees 77 numbers per step: joint positions and velocities, end-effector pose and velocity in world frame, the current reference (target pose, target velocity, a phase variable, and a 5-step lookahead window at 50 ms spacing), explicit tracking errors so the policy doesn't have to subtract them itself, and a scalar manipulability measure √det(J Jᵀ) for singularity awareness. The critic sees the same terms with the noise stripped.
+**State.** The actor sees 77 scalars per step:
 
-**Action.** delta-joint position at 50 Hz, clipped to ±0.1 rad per joint per step. Delta-control is a standard choice in humanoid RL (DeepMimic-style residual actions on top of a reference, and most modern locomotion/loco-manipulation work): zero output means "hold pose", so smoothness is built into the parameterization.
+- proprio: joint positions and velocities (7 + 7)
+- EE state: position, orientation, linear and angular velocity in world frame
+- reference: target pose, target velocity, phase variable, and a 5-step lookahead window at 50 ms spacing
+- tracking errors: position and orientation error precomputed, so the policy doesn't have to subtract them itself
+- manipulability: scalar √det(J Jᵀ) for singularity awareness
+
+The critic sees the same terms with the noise stripped.
+
+**Action.** delta-joint position at 50 Hz, clipped to ±0.1 rad per joint per step:
+
+```
+q_des,t = q_t + clip(a_t, -0.1, 0.1)        a_t ∈ ℝ⁷
+```
+
+Delta-control is a standard choice in humanoid RL (DeepMimic-style residual actions on top of a reference, and most modern locomotion/loco-manipulation work): zero output means "hold pose", so smoothness is built into the parameterization.
 
 **Reward.** Sum of:
 
-- **Position tracking** — two-scale Gaussian on ‖p_ref − p_ee‖, with a coarse and a fine kernel combined to avoid the *cliff effect*: a single Gaussian either has a wide basin with no sub-cm gradient, or a narrow basin that gives zero gradient when far. An unbounded L2 penalty sits on top so the policy can't drift when both kernels saturate.
-- **Orientation tracking** — two-scale Gaussian on the geodesic angle between target and current EE quaternion (same coarse/fine reasoning as above).
-- **Velocity alignment** — `v_ee · v̂_ref`, a small bonus for moving along the reference tangent.
-- **Smoothness** — penalties on action rate (first derivative) and action jerk (second derivative). The jerk term is the one that kills the high-frequency jitter visible at play time.
-- **Singularity barrier** — one-sided hinge on the manipulability deficit `max(0, w_min − w(q))²`, active only when the arm gets close to a singular configuration.
+- **Position tracking**, two-scale Gaussian kernel on the position error `e_p = ‖p_ref − p_ee‖`:
+
+  ```
+  r_pos = (1 − f_w) · exp(−α_c · e_p²) + f_w · exp(−α_f · e_p²)
+  ```
+
+  The coarse kernel (small α) gives a wide basin with gradient even when far from the target; the fine kernel (large α) gives sharp gradient at sub-cm scale. Mixing them avoids the *cliff effect* a single Gaussian would suffer: either too wide and no fine-tuning signal, or too narrow and zero gradient when far. On top, an unbounded L2 penalty so the policy can't drift when both kernels saturate:
+
+  ```
+  r_L2 = −‖e_p‖²
+  ```
+
+- **Orientation tracking**, same two-scale formulation on the geodesic angle between target and current EE quaternion.
+
+- **Velocity alignment**, a small bonus for moving along the reference tangent:
+
+  ```
+  r_vel = v_ee · v̂_ref
+  ```
+
+- **Smoothness**, penalties on action rate and action jerk. The jerk term is the one that kills the high-frequency jitter visible at play time:
+
+  ```
+  r_rate  = −‖a_t − a_{t-1}‖²
+  r_jerk  = −‖a_t − 2 a_{t-1} + a_{t-2}‖²
+  ```
+
+- **Singularity barrier**, one-sided hinge on the manipulability deficit, active only when the arm gets close to a singular configuration:
+
+  ```
+  r_sing = −max(0, w_min − w(q))²
+  ```
 
 **Trajectory.** Random splines through six waypoints, regenerated every six seconds. Each segment is a quintic polynomial
 
@@ -53,17 +94,17 @@ Orientation is generated independently. Random target quaternions at each waypoi
 **Uncertainty.** Three sources, all active during training:
 
 
-- **Observation noise** — uniform, on every measurement-like channel (proprio, EE state, tracking errors). Trajectory reference signals stay clean: they are commands input into the policy, not sensor readings.
-- **Action delay** — each command held in a buffer for a stochastic 1–5 control steps before reaching the simulator.
-- **Domain randomization** — link inertia (±15%) and joint friction (0–0.2 N·m), resampled at every episode reset.
+- **Observation noise**: uniform, on every measurement-like channel (proprio, EE state, tracking errors). Trajectory reference signals stay clean: they are commands input into the policy, not sensor readings.
+- **Action delay**: each command held in a buffer for a stochastic 1–5 control steps before reaching the simulator.
+- **Domain randomization**: link inertia (±15%) and joint friction (0–0.2 N·m), resampled at every episode reset.
 
 **RL.** PPO with an asymmetric actor-critic. The actor trains on the noisy and delayed observation, the critic sees the clean ground truth. The lookahead window in the observation is what makes anticipation under delay possible: the policy can aim ahead.
 
 ## Results
 
-Position RMSE in mm, orientation RMSE in degrees, jerk RMS in m/s³. Full uncertainty stack unless stated. `p50` and `p95` are the median and the 95th percentile across 256 parallel envs.
+Full uncertainty stack unless stated. `p50` and `p95` are the median and the 95th percentile across 256 parallel envs.
 
-| | Pos RMSE | Ori RMSE | Jerk RMS |
+| | Pos RMSE [mm] | Ori RMSE [deg] | Jerk RMS [m/s³] |
 |---|---:|---:|---:|
 | Training distribution, p50 (256 envs)   | 15.2 | 3.8  | 125  |
 | Training distribution, p95              | 61   | 18.5 | 237  |
@@ -74,13 +115,13 @@ Circle and figure-8 are out-of-distribution: the policy only ever saw random qui
 
 **Robustness ablation** (same checkpoint, varying uncertainty at evaluation):
 
-| | Circle | Figure-8 |
+| | Circle [mm] | Figure-8 [mm] |
 |---|---:|---:|
-| Noise only                              | 8.0 mm | 9.0 mm |
-| Noise + action delay                    | **6.5 mm** | **6.3 mm** |
-| Noise + delay + DR                      | 6.7 mm | 7.2 mm |
+| Noise only                              | 8.0 | 9.0 |
+| Noise + action delay                    | **6.5** | **6.3** |
+| Noise + delay + DR                      | 6.7 | 7.2 |
 
-The policy tracks *best* with the training-time delay active. The reason is that the policy has learned to use the lookahead window to compensate for the delay — effectively aiming a few control steps ahead so that, by the time the action lands, the EE is on the reference. Removing the delay at evaluation breaks that compensation: the action arrives instantly while the policy is still aiming ahead, producing a small but consistent overshoot. Adding domain randomization on top of the delay costs at most ~1 mm.
+The policy tracks *best* when the training-time delay is active, not when it is removed. During training the policy learns to use the lookahead window to anticipate the delay: it aims a few control steps ahead, so by the time the action reaches the simulator the EE is on the reference. Removing the delay at evaluation time breaks this compensation. The action lands immediately while the policy is still aiming ahead, producing a small but consistent overshoot. Adding domain randomization on top costs at most ~1 mm.
 
 ## Videos
 
