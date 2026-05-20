@@ -1,15 +1,3 @@
-"""
-Examples:
-
-    uv run python scripts/eval_play.py \\
-        --checkpoint logs/rsl_rl/franka_ee_tracking/<run>/model_2999.pt \\
-        --trajectory circle --duration 8.0 --radius 0.15
-
-    uv run python scripts/eval_play.py \\
-        --checkpoint logs/rsl_rl/franka_ee_tracking/<run>/model_2999.pt \\
-        --trajectory figure8 --duration 8.0 --scale 0.18
-"""
-
 from __future__ import annotations
 
 import argparse
