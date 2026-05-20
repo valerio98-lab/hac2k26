@@ -24,6 +24,41 @@ uv run play Hac2k26-EETracking-Franka --checkpoint-file <path>
 
 Training takes about three hours on a single RTX 4070.
 
+## Short note
+
+**State**: 77-dim actor observation (critic sees the same, noise-stripped):
+
+- proprio (21)
+- EE state (15)
+- reference signal + 5-step position lookahead (28)
+- precomputed tracking errors (12)
+- manipulability scalar (1)
+
+**Action**: delta-joint position at 50 Hz, DeepMimic-style residual (zero output holds the pose):
+
+- `q_des,t = q_t + clip(a_t, ±0.1)`, clipped to ±0.1 rad per step
+
+**Reward**: sum of:
+
+- two-scale Gaussian on position error (coarse + fine kernel, to avoid the cliff effect)
+- two-scale Gaussian on orientation error (same kernel structure, geodesic angle)
+- L2 penalty on position error
+- velocity-alignment bonus along the reference tangent
+- action rate + action jerk penalties (smoothness)
+- one-sided singularity barrier on manipulability deficit
+
+**Trajectory**: random quintic splines, regenerated every 6 s:
+
+- 6 waypoints per spline, fitted in cylindrical (r, θ, z) and mapped back to Cartesian
+- C² continuity at every waypoint, jerk bounded by construction
+- orientation generated independently via a quintic smoothstep on the axis-angle log (SLERP-equivalent)
+
+**Evaluation**: position RMSE [mm], orientation RMSE [deg], jerk RMS [m/s³]:
+
+- 256 parallel envs on random in-distribution trajectories → p50 + p95
+- two fixed OOD references: circle r = 20 cm, figure-8 scale = 18 cm
+- robustness ablation: same checkpoint evaluated with progressively richer training-time uncertainty
+
 ## The problem
 
 Tracking 3D end-effector trajectories on a 7-DOF arm is something classical model-based / task-space controllers do well in clean simulation. Three things break that recipe and motivate using RL here:
@@ -44,32 +79,39 @@ The policy outputs *deltas* on the current joint configuration, not absolute joi
 q_des,t = q_t + clip(a_t, -0.1, 0.1)        a_t ∈ ℝ⁷
 ```
 
-Zero output means "hold pose": smoothness is built into the parameterization, not bolted on as a regularizer. This is the standard choice in modern humanoid RL (DeepMimic-style residual actions on top of a reference). On top, the reward includes explicit penalties on action rate and action jerk:
+When the policy output is zero, the joints don't move. Smoothness comes from how the action is defined, not from an extra penalty added on top. This is the standard choice in modern humanoid RL (DeepMimic-style residual actions on top of a reference). On top, the reward includes explicit penalties on action rate and action jerk:
 
 ```
 r_rate = −‖a_t − a_{t-1}‖²
 r_jerk = −‖a_t − 2 a_{t-1} + a_{t-2}‖²
 ```
 
-The rate term tames first-order jitter; the jerk term kills the high-frequency oscillation that appears once the rate penalty is dialled in.
+The rate term suppresses step-to-step jitter. Once the rate term is in place, a higher-frequency oscillation tends to appear in the output, and the jerk term suppresses that as well.
 
 **2. Sparse reward landscape: two-scale Gaussian kernels.**
 
-The natural reward for tracking is a Gaussian on the error, `r = exp(−α e²)`. With a single α you face a dilemma: a small α gives a wide basin and dense gradient when far from the target, but no signal at sub-cm scale; a large α gives sharp gradient when close but is flat everywhere else. This is the *cliff effect*: the policy gets no learning signal until it stumbles inside the narrow basin.
-
-The reward sums two kernels, coarse and fine:
+The natural reward for tracking is a Gaussian on the error, `r = exp(−α e²)`. To avoid the *cliff effect* I opted for a sum of two kernels, coarse and fine, applied to both position and orientation. On the position error `e_p = ‖p_ref − p_ee‖`:
 
 ```
 r_pos = (1 − f_w) · exp(−α_c · e_p²) + f_w · exp(−α_f · e_p²)
 ```
 
-The coarse term provides gradient at large errors; the fine term provides gradient at small errors. An unbounded L2 penalty sits underneath so the policy can't drift when both kernels saturate:
+Same structure on the geodesic orientation error `e_q` between the target and current EE quaternion:
+
+```
+r_ori = (1 − f_w) · exp(−α_c · e_q²) + f_w · exp(−α_f · e_q²)
+```
+
+Coarse α covers gradient at large errors, fine α covers sub-cm distance. An unbounded L2 penalty sits underneath so the policy can't drift when both kernels saturate:
 
 ```
 r_L2 = −‖e_p‖²
 ```
 
-The same formulation is used for orientation, on the geodesic angle between target and current EE quaternion. Two small auxiliary terms close out the reward: a velocity-alignment bonus that rewards moving along the reference tangent, and a one-sided singularity barrier that activates only when the arm approaches a singular configuration.
+Two small auxiliary terms close out the reward:
+
+- velocity-alignment bonus, rewarding motion along the reference tangent
+- one-sided singularity barrier, active only when the arm approaches a singular configuration
 
 ```
 r_vel  = v_ee · v̂_ref
@@ -83,23 +125,28 @@ A buffered command lag of 1–5 control steps is active throughout training. A n
 Two ingredients make compensation possible:
 
 - The observation includes an explicit **lookahead window** of 5 future reference samples at 50 ms spacing. The policy can see where the target is going, not just where it is now.
-- The architecture is **asymmetric**: the actor sees noisy, delayed observations; the critic sees clean ground truth. The critic provides high-fidelity value estimates without paying the cost of inferring the world from a corrupted input.
+- The architecture is **asymmetric**: the actor sees noisy, delayed observations; the critic sees clean ground truth.
 
 The policy learns to aim ahead in time, so that by the moment the action reaches the simulator the EE is on the reference. The Results section below shows the consequence directly: tracking *improves* when the training-time delay is active, because removing it breaks the compensation the policy has learned.
 
 **4. Reference design: random quintic splines in cylindrical coordinates.**
 
-A tracking policy is only as smooth as the reference it follows. A target trajectory with discontinuities in velocity or acceleration forces the policy to either reproduce them (jitter) or lag behind. The reference here is a sequence of quintic polynomials:
+A discontinuous reference in velocity or acceleration forces the policy to either reproduce the jumps (jitter) or lag behind. The reference here is a sequence of quintic polynomials:
 
 ```
 p(τ) = c₀ + c₁ τ + c₂ τ² + c₃ τ³ + c₄ τ⁴ + c₅ τ⁵
 ```
 
-with six coefficients pinned by six boundary conditions at each segment endpoint (position, velocity, zero acceleration). This gives C² continuity at every waypoint and bounds the jerk by construction. There is no infinite spike for the policy to fight.
+Six coefficients pinned by six BCs at each segment endpoint (position, velocity, zero acceleration): C² continuity at every waypoint, jerk bounded by construction.
 
-The choice has a second purpose: generalization. Trajectories are randomly resampled every six seconds, a different spline through six random waypoints each time. The policy never sees the same trajectory twice and is forced to learn *tracking*, not memorization. This is what makes the OOD generalization to circle and figure-8 at evaluation time possible (see Results).
+Second purpose: generalization. A new spline through six random waypoints is resampled every 6 s. The policy never sees the same trajectory twice and learns *tracking*, not memorization. That is what makes the OOD circle and figure-8 at evaluation possible (see Results).
 
-**How I got to the cylindrical fit.** The first version used straight-line segments between waypoints. Tracking was extremely accurate locally but fragile out of distribution: the policy nailed the random splines it was trained on and even shapes not seen during training, but failed on extreme OOD shapes like the r = 0.4 m circle at evaluation. I widened the workspace sampling to push more variety into training, and a new problem appeared — some Cartesian segments now passed through the base of the robot. Fitting the spline in cylindrical (r, θ, z) coordinates and mapping back to Cartesian fixed both at once: the lift arcs around the base, and a minimum radius keeps the spline away from the shoulder-wrist singularity region.
+**How I got to the cylindrical fit.**
+
+- v1: straight-line segments between waypoints. Locally accurate, but fragile out of distribution — generalized to many unseen splines, failed the r = 0.4 m circle at evaluation.
+- Fix attempt: widen the workspace sampling for more training variety.
+- New issue: some Cartesian segments now passed through the base of the robot.
+- v2: fit the spline in cylindrical (r, θ, z), then map back to Cartesian. The lift arcs around the base; a minimum radius keeps the spline away from the shoulder-wrist singularity region.
 
 The remaining geometric details:
 
@@ -108,15 +155,13 @@ The remaining geometric details:
 
 ## Training stack
 
-**Observation.** 77 scalars per step, grouped so the count is verifiable:
+**Observation breakdown** (the headline in *Short note* expands to):
 
 - proprio (21): joint positions (7), joint velocities (7), last action (7)
 - EE state (15): position (3), 6D orientation (6), linear velocity (3), angular velocity (3)
 - reference (28): target position (3), target velocity (3), target 6D orientation (6), phase variable (1), 5-step lookahead of future positions (3 × 5)
 - tracking errors (12): position (3), linear velocity (3), orientation as axis-angle (3), angular velocity (3)
 - manipulability (1)
-
-The critic sees the same terms with the noise stripped.
 
 **Uncertainty sources**, all active during training:
 
@@ -156,7 +201,7 @@ The policy tracks *best* when the training-time delay is active, not when it is 
   <img src="media/figure8/figure8.gif" width="380">
 </p>
 
-Small circle (r = 20 cm) and figure-8 (scale = 30 cm). A larger circle (r = 40 cm) reaches the edge of the trained workspace; the policy still tracks, with localized jitter, graceful degradation as the reference approaches the workspace boundary.
+**Both shapes are unseen during training: the policy was only trained on random quintic splines.** Small circle (r = 20 cm) and figure-8 (scale = 30 cm). A larger circle (r = 40 cm) reaches the edge of the trained workspace; the policy still tracks, with localized jitter, graceful degradation as the reference approaches the workspace boundary.
 
 <p align="center"><img src="media/circle/circle_04.gif" width="640"></p>
 
